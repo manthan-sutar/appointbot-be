@@ -150,6 +150,12 @@ router.get('/', (req, res) => {
 
 // ─── Core message handler (shared by WhatsApp Cloud + web chat proxy) ────────
 async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberForRouting }) {
+  console.log('[Webhook] Incoming message payload:', {
+    rawPhone,
+    explicitBusinessId,
+    toNumberForRouting,
+    preview: typeof message === 'string' ? message.slice(0, 120) : message,
+  });
   const phone = normalizePhone(rawPhone);
 
   // Resolve business from explicitId, WhatsApp number, or fallback

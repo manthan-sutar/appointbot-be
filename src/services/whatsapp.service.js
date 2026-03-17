@@ -106,9 +106,12 @@ export async function sendWhatsAppText(to, body, businessId) {
   const { accessToken, phoneNumberId, apiVersion } = await getBusinessWhatsAppConfig(businessId);
 
   if (!accessToken || !phoneNumberId) {
-    console.warn(
-      `[WhatsApp] Cloud API not configured — skipping message to ${to} (biz ${businessId ?? 'global'})`,
-    );
+    console.warn('[WhatsApp] Cloud API not configured, skipping text send:', {
+      to,
+      businessId: businessId ?? 'global',
+      hasAccessToken: Boolean(accessToken),
+      hasPhoneNumberId: Boolean(phoneNumberId),
+    });
     return;
   }
 
@@ -146,9 +149,13 @@ export async function sendWhatsAppTemplate(to, templateName, bodyParams = [], bu
   const { accessToken, phoneNumberId, apiVersion } = await getBusinessWhatsAppConfig(businessId);
 
   if (!accessToken || !phoneNumberId) {
-    console.warn(
-      `[WhatsApp] Cloud API not configured — skipping template "${templateName}" to ${to} (biz ${businessId ?? 'global'})`,
-    );
+    console.warn('[WhatsApp] Cloud API not configured, skipping template send:', {
+      to,
+      templateName,
+      businessId: businessId ?? 'global',
+      hasAccessToken: Boolean(accessToken),
+      hasPhoneNumberId: Boolean(phoneNumberId),
+    });
     return;
   }
 
