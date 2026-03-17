@@ -1,0 +1,1554 @@
+import express from 'express';
+import {
+  getSession, updateSession, resetSession, normalizePhone, STATES,
+} from '../services/session.service.js';
+import {
+  getServices, findService, getStaff, getAvailableSlots, getAvailableSlotsForRange,
+  getFirstStaffWithSlotsOnDate, localToUTC, findNextSlotNearTime,
+  bookAppointment, getUpcomingAppointments, cancelAppointment, rescheduleAppointment,
+  getLastBookedService,
+  getCustomerName, upsertCustomer, getBusiness, getBusinessByPhone,
+} from '../services/appointment.service.js';
+import {
+  extractBookingIntent, classifyMessage, extractConfirmation, answerConversational,
+  extractRescheduleIntent, extractAvailabilityQuery,
+  generateInactivityNudge, generateDynamicFallbackReply, generateHelpReply,
+  generateReturningUserGreeting,
+} from '../services/ai.service.js';
+import {
+  formatWelcome, formatServiceList, formatStaffList, formatSlotList, curateSlots,
+  formatConfirmationPrompt, formatBookingConfirmed, formatAppointmentList,
+  formatCancellationConfirmed, formatRescheduleConfirmed, formatAvailabilitySummary,
+  formatHandoffMessage, formatError, formatNotUnderstood, formatFriendlyFallback,
+  formatDate, formatTime, formatDateTime, timeToMinutes, getTimeNotAvailableReason,
+} from '../utils/formatter.js';
+import { sendWhatsAppText } from '../services/whatsapp.service.js';
+import { transcribeMetaAudio } from '../services/whisper.service.js';
+
+const router = express.Router();
+const DEFAULT_BUSINESS_ID = parseInt(process.env.DEFAULT_BUSINESS_ID || '1', 10);
+
+// ─── Inactivity nudge scheduler (per phone+business) ─────────────────────────
+// After a few minutes of no reply mid-flow, send a gentle, AI-generated nudge.
+
+const NUDGE_DELAY_MS = 5 * 60 * 1000;
+const nudgeTimers = new Map(); // key: `${phone}:${businessId}` → { timeoutId, baselineUpdatedAt }
+
+function scheduleInactivityNudge({ phone, businessId, businessName, businessType, lastStepDescription, baselineUpdatedAt }) {
+  const key = `${phone}:${businessId}`;
+  const existing = nudgeTimers.get(key);
+  if (existing?.timeoutId) clearTimeout(existing.timeoutId);
+
+  const timeoutId = setTimeout(async () => {
+    try {
+      const session = await getSession(phone, businessId);
+      // Session timed out or went idle or moved since we scheduled → no nudge.
+      if (session.timedOut || session.state === STATES.IDLE) return;
+      if (session.updatedAt && session.updatedAt.toString() !== baselineUpdatedAt.toString()) return;
+
+      const message = await generateInactivityNudge({
+        businessName,
+        businessType,
+        lastStepDescription,
+      });
+      await sendWhatsAppText(phone, message, businessId);
+    } catch (err) {
+      console.error('[Nudge] Failed to send inactivity nudge:', err.message);
+    } finally {
+      nudgeTimers.delete(key);
+    }
+  }, NUDGE_DELAY_MS);
+
+  nudgeTimers.set(key, { timeoutId, baselineUpdatedAt });
+}
+
+// Cancel any pending nudge for this user — call whenever a new message arrives.
+function clearInactivityNudge(phone, businessId) {
+  const key = `${phone}:${businessId}`;
+  const existing = nudgeTimers.get(key);
+  if (existing?.timeoutId) {
+    clearTimeout(existing.timeoutId);
+    nudgeTimers.delete(key);
+  }
+}
+
+// ─── Re-prompt the current step when user says CONTINUE ──────────────────────
+async function resumeStep(state, temp, businessId) {
+  switch (state) {
+    case STATES.AWAITING_SERVICE:
+      return formatServiceList(temp.services || []);
+    case STATES.AWAITING_DATE:
+      return `Great! *${temp.serviceName}* is selected.\n\nWhat date works for you? (e.g. "tomorrow", "Monday", "March 10")`;
+    case STATES.AWAITING_TIME: {
+      const allSlots = await getAvailableSlots(businessId, temp.date, temp.staffId, temp.durationMinutes || 30);
+      if (!allSlots.length) return `No slots left on *${formatDate(temp.date)}*. What other date works?`;
+      const display = temp.displaySlots?.length ? temp.displaySlots : curateSlots(allSlots, 6);
+      return `Got it — *${formatDate(temp.date)}*.\n\n` + formatSlotList(display, temp.date);
+    }
+    case STATES.AWAITING_NAME:
+      return `Almost there! What name should we put the booking under?`;
+    case STATES.AWAITING_CONFIRMATION:
+      return formatConfirmationPrompt(temp.pendingBooking);
+    default:
+      return `Let's start fresh. What would you like to do?\n\n📅 Book · ❌ Cancel · 🔄 Reschedule · 📋 My Appointments`;
+  }
+}
+
+// ─── Keyword fast-paths ───────────────────────────────────────────────────────
+// Normalize for matching: trim and strip trailing ? . !
+function normForKeywords(msg) {
+  return (msg || '').trim().replace(/[\?\.\!]+$/, '').trim();
+}
+
+const KEYWORD_HELP = /^(help|hi|hello|start|menu|helo|hii|hey|sup|supp|yo)\s*[\?\.\!]*$/i;
+// "What can you do?" / "How can you help?" — treat as HELP so we always show the menu, no LLM/hiccup
+const KEYWORD_HELP_QUESTIONS = /^(what\s+(can\s+)?(you|u)\s+(can\s+)?do|how\s+(can\s+)?(you|u)\s+(can\s+)?help(\s+me)?|what\s+do\s+you\s+do|how\s+(you|u)\s+can\s+(help|assist)(\s+me)?)\s*[\?\.\!]*$/i;
+const KEYWORD_SERVICES = /^(services|service list|what services|what do you offer|what can i book)$/i;
+const KEYWORD_CANCEL_FLOW = /^(cancel|stop|quit|exit|nahi|nope|no thanks)$/i;
+
+// "My bookings" intent fallback: when LLM says "none", treat these as my_appointments
+// (1) Full phrase match for common phrasings
+const KEYWORD_MY_BOOKINGS = /^(can\s+(you|u)\s+)?(show\s+(me\s+)?)?(my\s+)(bookings?|appointments?)|^(what('s|s|\s+are)\s+my\s+bookings?)|^(upcoming\s+appointments?)|^(list\s+my\s+bookings?)|^(show\s+(me\s+)?my\s+bookings?)|^(how\s+(are\s+)?)?(my\s+)(bookings?|appointments?)(\s+please)?\s*[\?\.\!]*$/i;
+// (2) Loose: message contains "my booking(s)" or "my appointment(s)" (e.g. "how my bookings please", "tell me my bookings")
+const CONTAINS_MY_BOOKINGS = /\bmy\s+bookings?\b|\bmy\s+appointments?\b/i;
+
+// Reminder intent override: if the LLM misclassifies "remind me at 7pm" as "book",
+// correct it here so the reminder path always fires.
+const KEYWORD_REMINDER_OVERRIDE = /\b(remind\s+me|set\s+(a\s+)?reminder|send\s+(me\s+)?(a\s+)?reminder)\b/i;
+
+// "Book the same again" / "rebook" — pre-fill last booked service
+const KEYWORD_SAME_SERVICE = /\b(same\s+(as\s+)?(last|before|previous|usual|time)|book\s+(it\s+)?again|same\s+service|rebook|same\s+thing)\b/i;
+
+// Post-action acknowledgements — "Great!", "Thanks", "Perfect" etc.
+// Skip the LLM entirely; reply with a brief, context-free thank-you.
+const KEYWORD_ACK = /^(great|thanks|thank\s*you|thankyou|thx|ty|perfect|awesome|excellent|nice|cool|sweet|ok\s*thanks|okay\s*thanks|got\s*it|noted|alright|brilliant|cheers|👍+|🙏+|😊+)[\s\!\.\,🙂😊]*$/i;
+
+// ─── Gibberish detector ────────────────────────────────────────────────────────
+// Returns true for obvious keyboard-mash; single-word only (spaces = real phrase).
+function looksLikeGibberish(msg) {
+  const s = (msg || '').trim().toLowerCase();
+  if (s.length < 3 || s.includes(' ') || /\d/.test(s)) return false;
+  // Pure repeated single char: "aaaaaaa"
+  if (/^(.)\1{5,}$/.test(s)) return true;
+  // Repeating short pattern at the start: "hahahaha", "lalalala", "asdasd"
+  if (/^(.{1,3})\1{3,}/.test(s) && s.length > 7) return true;
+  // No vowels in a reasonably long string: "hjklzxcvb", "qwrty"
+  if (s.length > 5 && !/[aeiou]/.test(s)) return true;
+  return false;
+}
+
+// ─── Meta WhatsApp Cloud API verification ────────────────────────────────────
+router.get('/', (req, res) => {
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+// ─── Core message handler (shared by WhatsApp Cloud + web chat proxy) ────────
+async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberForRouting }) {
+  const phone = normalizePhone(rawPhone);
+
+  // Resolve business from explicitId, WhatsApp number, or fallback
+  let businessId = explicitBusinessId ? parseInt(explicitBusinessId, 10) : null;
+  if (!businessId) {
+    const toNumber = toNumberForRouting || '';
+    if (toNumber) {
+      const biz = await getBusinessByPhone(toNumber);
+      businessId = biz?.id || DEFAULT_BUSINESS_ID;
+    } else {
+      businessId = DEFAULT_BUSINESS_ID;
+    }
+  }
+
+  let reply = '';
+
+  // Hoist vars used by the nudge scheduler AFTER the try-catch block
+  let nextState = null;
+  let lastStepDescriptionForNudge = '';
+  let businessName = 'our business';
+  let businessType = null;
+  let updatedAt    = null;
+
+  try {
+    // User replied → cancel any pending inactivity nudge immediately
+    clearInactivityNudge(phone, businessId);
+
+    const session  = await getSession(phone, businessId);
+    const { state, temp, timedOut, updatedAt: sessionUpdatedAt } = session;
+    updatedAt = sessionUpdatedAt;
+
+    const [savedName, business] = await Promise.all([
+      getCustomerName(phone, businessId),
+      getBusiness(businessId),
+    ]);
+
+    businessName = business?.name || 'our business';
+    businessType = business?.type  || null;
+    const businessTZ   = business?.timezone || 'Asia/Kolkata';
+
+    // ── HELP fast-path ────────────────────────────────────────────────────────
+    const msgNorm = normForKeywords(message);
+    if (KEYWORD_HELP.test(msgNorm) || KEYWORD_HELP_QUESTIONS.test(msgNorm)) {
+      const services = await getServices(businessId);
+      if (state !== STATES.IDLE && temp.serviceName) {
+        reply = `👋 ${savedName ? `Welcome back, *${savedName}*!` : 'Hey there!'}\n\n` +
+          `You have an unfinished booking for *${temp.serviceName}*.\n\n` +
+          `Reply *CONTINUE* to pick up where you left off, or *RESTART* to start fresh.`;
+        return { reply, businessId };
+      }
+
+      let helpReply = null;
+
+      // Returning customer says Hi/Hello/Hey → short personal greeting, not the full menu
+      if (KEYWORD_HELP.test(msgNorm) && savedName) {
+        try {
+          helpReply = await generateReturningUserGreeting({
+            businessName, customerName: savedName, businessType, services,
+          });
+        } catch (err) {
+          console.error('[Webhook] generateReturningUserGreeting failed:', err.message);
+        }
+      }
+
+      // New user, or "what can you do?" type question → full dynamic help menu
+      if (!helpReply) {
+        try {
+          helpReply = await generateHelpReply({
+            businessName, businessType, services, customerName: savedName || null,
+          });
+        } catch (err) {
+          console.error('[Webhook] generateHelpReply failed:', err.message);
+        }
+      }
+
+      reply = helpReply || formatWelcome(businessName, services, savedName, businessType);
+      await resetSession(phone, businessId);
+      return { reply, businessId };
+    }
+
+    // ── SERVICES fast-path (works from any state) ─────────────────────────────
+    if (KEYWORD_SERVICES.test(message)) {
+      const services = await getServices(businessId);
+      reply = formatServiceList(services, businessType);
+      return { reply, businessId };
+    }
+
+    // ── MY BOOKINGS fast-path (works from any state) ───────────────────────────
+    // Ensures "show my bookings" / "my bookings" always get the list, not the hiccup message.
+    if (!/^cancel\s+/i.test(msgNorm) && (KEYWORD_MY_BOOKINGS.test(msgNorm) || CONTAINS_MY_BOOKINGS.test(message || ''))) {
+      try {
+        const appointments = await getUpcomingAppointments(phone, businessId);
+        reply = formatAppointmentList(appointments, savedName, businessType, businessTZ);
+      } catch (err) {
+        console.error('[Webhook] My-bookings fast-path failed:', err.message);
+        reply = formatFriendlyFallback('Could not load your bookings right now. Please try again in a moment.');
+      }
+      return { reply, businessId };
+    }
+
+    // ── CONTINUE / RESTART mid-flow ───────────────────────────────────────────
+    if (/^(continue|resume|yes continue)$/i.test(message) && state !== STATES.IDLE) {
+      reply = await resumeStep(state, temp, businessId);
+      return { reply, businessId };
+    }
+    if (/^(restart|start over|new booking)$/i.test(message)) {
+      const services = await getServices(businessId);
+      reply = formatWelcome(businessName, services, savedName, businessType);
+      await resetSession(phone, businessId);
+      return { reply, businessId };
+    }
+
+    // ── CANCEL-FLOW fast-path (clears current booking flow, not an appointment) ─
+    if (KEYWORD_CANCEL_FLOW.test(message) && state !== STATES.IDLE) {
+      reply = `✅ No problem, I've cleared that. What else can I help you with?\n\nType *HELP* to see options.`;
+      await resetSession(phone, businessId);
+      return { reply, businessId };
+    }
+
+    // ── State machine ─────────────────────────────────────────────────────────
+    nextState = state;
+    switch (state) {
+
+      // ── AWAITING_HANDOFF ─────────────────────────────────────────────────
+      case STATES.AWAITING_HANDOFF: {
+        reply = `The *${businessName}* team will reach out to you soon.\n\nIs there anything else I can help with in the meantime? Type *HELP* to see options.`;
+        await resetSession(phone, businessId);
+        nextState = STATES.IDLE;
+        break;
+      }
+
+      // ── AWAITING_NAME ─────────────────────────────────────────────────────
+      case STATES.AWAITING_NAME: {
+        const name = message.trim();
+        if (!name || name.length < 2) {
+          reply = 'Please enter your name so we can confirm the booking.';
+          break;
+        }
+        await upsertCustomer(phone, businessId, name);
+        const { pendingBooking } = temp;
+        const updatedBooking = { ...pendingBooking, customerName: name };
+        await updateSession(phone, businessId, STATES.AWAITING_CONFIRMATION, {
+          ...temp, customerName: name, pendingBooking: updatedBooking,
+        });
+        nextState = STATES.AWAITING_CONFIRMATION;
+        lastStepDescriptionForNudge = 'Confirming the booking details.';
+        reply = formatConfirmationPrompt(updatedBooking, businessType);
+        break;
+      }
+
+      // ── AWAITING_CONFIRMATION ─────────────────────────────────────────────
+      case STATES.AWAITING_CONFIRMATION: {
+        const answer = await extractConfirmation(message);
+        if (answer === 'yes') {
+          const { pendingBooking } = temp;
+          try {
+            const appt = await bookAppointment(pendingBooking);
+
+            // ── Smart reminder scheduling ────────────────────────────────────
+            const apptUTC    = localToUTC(pendingBooking.date, pendingBooking.time, businessTZ);
+            const hoursUntil = (apptUTC.getTime() - Date.now()) / 3_600_000;
+
+            let reminderNote;
+            if (hoursUntil > 25) {
+              // Cron job handles the 24-hour reminder; tell the user
+              reminderNote = undefined; // keeps the legacy "24 hours before" line
+            } else if (hoursUntil > 1.5) {
+              // Schedule a 1-hour-before reminder right now
+              reminderNote = `I'll send you a reminder 1 hour before your appointment.`;
+              const delayMs = apptUTC.getTime() - Date.now() - 60 * 60 * 1000;
+              if (delayMs > 0) {
+                setTimeout(async () => {
+                  try {
+                    const body =
+                      `⏰ *Reminder!*\n\n` +
+                      `Your *${pendingBooking.serviceName}* appointment is in 1 hour!\n\n` +
+                      `Staff: ${pendingBooking.staffName}\n` +
+                      `Time: ${formatTime(pendingBooking.time)}\n\n` +
+                      `See you soon! 😊`;
+                    await sendWhatsAppText(phone, body, businessId);
+                    console.log(`[Reminder] 1-hour reminder sent to ${phone} (biz ${businessId})`);
+                  } catch (e) {
+                    console.error(`[Reminder] 1-hour reminder failed for ${phone}:`, e.message);
+                  }
+                }, delayMs);
+              }
+            } else {
+              // Appointment is in under 90 minutes — no reminder possible
+              reminderNote = null;
+            }
+
+            reply = formatBookingConfirmed({
+              serviceName:   pendingBooking.serviceName,
+              staffName:     pendingBooking.staffName,
+              date:          pendingBooking.date,
+              time:          pendingBooking.time,
+              customerName:  pendingBooking.customerName,
+              appointmentId: appt.id,
+              businessName,
+              businessType,
+              reminderNote,
+            });
+            await resetSession(phone, businessId);
+          } catch (err) {
+            if (err.message === 'SLOT_TAKEN') {
+              const altSlots = err.slots || [];
+              const display  = curateSlots(altSlots, 6);
+              if (display.length) {
+                await updateSession(phone, businessId, STATES.AWAITING_TIME, {
+                  ...temp, time: null, displaySlots: display,
+                });
+                reply = `Sorry, *${formatTime(pendingBooking.time)}* was just taken by someone else! 😅\n\n` +
+                  formatSlotList(display, pendingBooking.date) +
+                  `\n\nPick another time and I'll lock it in for you.`;
+              } else {
+                await updateSession(phone, businessId, STATES.AWAITING_DATE, {
+                  ...temp, date: null, time: null, displaySlots: null,
+                });
+                reply = `Sorry, that slot was just taken and there are no more slots on *${formatDate(pendingBooking.date)}*.\n\nWhat other date works for you?`;
+              }
+            } else {
+              throw err;
+            }
+          }
+          nextState = STATES.IDLE;
+        } else if (answer === 'no') {
+          reply = `✅ No problem, booking cancelled. Just tell me what you need!`;
+          await resetSession(phone, businessId);
+          nextState = STATES.IDLE;
+        } else {
+          reply = `Please confirm — reply *YES* to book or *NO* to cancel.\n\n${formatConfirmationPrompt(temp.pendingBooking, businessType)}`;
+          nextState = STATES.AWAITING_CONFIRMATION;
+          lastStepDescriptionForNudge = 'Waiting for them to confirm YES or NO.';
+        }
+        break;
+      }
+
+      // ── AWAITING_SERVICE ─────────────────────────────────────────────────
+      case STATES.AWAITING_SERVICE: {
+        const services = temp.services || [];
+        const idx = parseInt(message, 10) - 1;
+        let chosen = null;
+
+        if (!isNaN(idx) && idx >= 0 && services[idx]) {
+          chosen = services[idx];
+        } else {
+          chosen = services.find(s => s.name.toLowerCase().includes(message.toLowerCase()));
+        }
+
+        if (!chosen) {
+          reply = `I didn't recognise that service. 🤔\n\n` + formatServiceList(services, businessType);
+          break;
+        }
+
+        const baseTemp = {
+          ...temp,
+          serviceId: chosen.id, serviceName: chosen.name,
+          durationMinutes: chosen.duration_minutes, price: chosen.price,
+        };
+
+        if (baseTemp.date && baseTemp.time) {
+          const staffList   = await getStaff(businessId);
+          const staffMember = staffList.find(s => s.id === baseTemp.staffId) || staffList[0];
+          if (!staffMember) {
+            reply = `Sorry, this business hasn't set up their team yet. Please check back soon!`;
+            await resetSession(phone, businessId);
+            break;
+          }
+          const allSlots = await getAvailableSlots(businessId, baseTemp.date, staffMember.id, chosen.duration_minutes);
+          if (!allSlots.length) {
+            await updateSession(phone, businessId, STATES.AWAITING_DATE, {
+              ...baseTemp, staffId: staffMember.id, displaySlots: null,
+            });
+            reply = `Great! *${chosen.name}* selected.\n\nSorry, no slots on *${formatDate(baseTemp.date)}*. What other date works for you?`;
+            break;
+          }
+          const exactMatch = allSlots.find(s => s === baseTemp.time);
+          if (!exactMatch) {
+            const display = curateSlots(allSlots, 6);
+            await updateSession(phone, businessId, STATES.AWAITING_TIME, {
+              ...baseTemp, staffId: staffMember.id, displaySlots: display,
+            });
+            reply = `Great! *${chosen.name}* selected.\n\n` +
+              `Sorry, *${formatTime(baseTemp.time)}* is not available on *${formatDate(baseTemp.date)}*.\n\n` +
+              formatSlotList(display, baseTemp.date) +
+              `\n\nReply with a time from the list above.`;
+            break;
+          }
+          const resolvedName  = savedName || null;
+          const pendingBooking = {
+            businessId, staffId: staffMember.id, serviceId: chosen.id,
+            serviceName: chosen.name, staffName: staffMember.name,
+            customerPhone: phone, customerName: resolvedName,
+            date: baseTemp.date, time: exactMatch,
+            durationMinutes: chosen.duration_minutes, price: chosen.price,
+          };
+          if (resolvedName) {
+            await updateSession(phone, businessId, STATES.AWAITING_CONFIRMATION, { ...baseTemp, pendingBooking });
+            reply = `*${chosen.name}* — perfect choice! 😊\n\n` + formatConfirmationPrompt(pendingBooking, businessType);
+          } else {
+            await updateSession(phone, businessId, STATES.AWAITING_NAME, { ...baseTemp, pendingBooking });
+            reply = `*${chosen.name}* — great choice! Almost there.\n\nWhat name should we put the booking under?`;
+          }
+          break;
+        }
+
+        if (baseTemp.date) {
+          const staffList2   = await getStaff(businessId);
+          const staffMember2 = staffList2.find(s => s.id === baseTemp.staffId) || staffList2[0];
+          const allSlots2    = await getAvailableSlots(businessId, baseTemp.date, staffMember2.id, chosen.duration_minutes);
+          if (!allSlots2.length) {
+            await updateSession(phone, businessId, STATES.AWAITING_DATE, {
+              ...baseTemp, staffId: staffMember2.id, displaySlots: null,
+            });
+            reply = `Great! *${chosen.name}* selected.\n\nSorry, no slots on *${formatDate(baseTemp.date)}*. What other date works for you?`;
+          } else {
+            const display2 = curateSlots(allSlots2, 6);
+            await updateSession(phone, businessId, STATES.AWAITING_TIME, {
+              ...baseTemp, staffId: staffMember2.id, displaySlots: display2,
+            });
+            reply = `Great! *${chosen.name}* selected.\n\n` + formatSlotList(display2, baseTemp.date);
+          }
+          break;
+        }
+
+        // ── Smart suggestion when time preference is stored but no date ──────
+        if (baseTemp.time) {
+          const staffList3  = await getStaff(businessId);
+          const staffMember3 = staffList3.find(s => s.id === baseTemp.staffId) || staffList3[0];
+          const suggested = staffMember3
+            ? await findNextSlotNearTime(businessId, staffMember3.id, chosen.duration_minutes, baseTemp.time, businessTZ)
+            : null;
+
+          if (suggested) {
+            const pendingBooking = {
+              businessId, staffId: staffMember3.id,
+              serviceId: chosen.id, serviceName: chosen.name,
+              staffName: staffMember3.name,
+              customerPhone: phone, customerName: savedName,
+              date: suggested.date, time: suggested.time,
+              durationMinutes: chosen.duration_minutes, price: chosen.price,
+            };
+            if (savedName) {
+              await updateSession(phone, businessId, STATES.AWAITING_CONFIRMATION, {
+                ...baseTemp, date: suggested.date, time: suggested.time, pendingBooking,
+              });
+              reply = `How about *${chosen.name}* on *${formatDate(suggested.date)}* at *${formatTime(suggested.time)}*? 😊\n\n` +
+                formatConfirmationPrompt(pendingBooking, businessType);
+              nextState = STATES.AWAITING_CONFIRMATION;
+              lastStepDescriptionForNudge = 'Suggested a smart slot and waiting for them to confirm.';
+            } else {
+              await updateSession(phone, businessId, STATES.AWAITING_NAME, {
+                ...baseTemp, date: suggested.date, time: suggested.time, pendingBooking,
+              });
+              reply = `How about *${chosen.name}* on *${formatDate(suggested.date)}* at *${formatTime(suggested.time)}*? 😊\n\nJust tell me the name for the booking!`;
+              nextState = STATES.AWAITING_NAME;
+              lastStepDescriptionForNudge = 'Suggested a smart slot and asking for their name.';
+            }
+            break;
+          }
+        }
+
+        await updateSession(phone, businessId, STATES.AWAITING_DATE, { ...baseTemp, displaySlots: null });
+        nextState = STATES.AWAITING_DATE;
+        lastStepDescriptionForNudge = `Asking which date works for their *${chosen.name}* booking.`;
+        reply = `Great! *${chosen.name}* selected.\n\nWhat date works for you? (e.g. "tomorrow", "Friday", "Dec 20")`;
+        break;
+      }
+
+      // ── AWAITING_DATE ─────────────────────────────────────────────────────
+      // Try preferred staff first (if user chose someone); otherwise first staff with slots on that day.
+      // Handles: one staff off Friday, other available Friday → use the one who works.
+      case STATES.AWAITING_DATE: {
+        const intent = await extractBookingIntent(message, [], businessTZ);
+        if (!intent.date) {
+          reply = `I couldn't understand that date. 🤔\n\nTry something like "tomorrow", "Monday", or "March 10".`;
+          break;
+        }
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: businessTZ });
+        if (intent.date < todayStr) {
+          reply = `That date has already passed! 😅 Please pick a future date (e.g. "tomorrow", "next Monday").`;
+          break;
+        }
+        const staffList = await getStaff(businessId);
+        if (!staffList?.length) {
+          reply = `Sorry, this business hasn't set up their team yet. Please check back soon!`;
+          await resetSession(phone, businessId);
+          break;
+        }
+        const duration = temp.durationMinutes || 30;
+        const result = await getFirstStaffWithSlotsOnDate(businessId, intent.date, duration, temp.staffId || null);
+        if (!result) {
+          reply = `Sorry, no slots are available on *${formatDate(intent.date)}*.\n\nWould you like to try a different date?`;
+          break;
+        }
+        const { staffId: staffIdForDate, staffName: staffNameForDate, slots: allSlots } = result;
+        const preferredName = temp.staffName;
+        const usedDifferentStaff = preferredName && preferredName !== staffNameForDate;
+        const staffNote = usedDifferentStaff
+          ? `*${preferredName}* isn't available that day. Here are slots with *${staffNameForDate}*:\n\n`
+          : '';
+
+        // ── Honor stored time preference ────────────────────────────────────────
+        if (temp.time) {
+          const exactMatch = allSlots.find(s => s === temp.time);
+
+          if (exactMatch) {
+            // Preferred time is available → skip the slot picker entirely
+            const pendingBooking = {
+              businessId, staffId: staffIdForDate, serviceId: temp.serviceId,
+              serviceName: temp.serviceName, staffName: staffNameForDate,
+              customerPhone: phone, customerName: savedName,
+              date: intent.date, time: exactMatch,
+              durationMinutes: temp.durationMinutes, price: temp.price,
+            };
+            if (savedName) {
+              await updateSession(phone, businessId, STATES.AWAITING_CONFIRMATION, {
+                ...temp, date: intent.date, staffId: staffIdForDate,
+                staffName: staffNameForDate, pendingBooking,
+              });
+              reply = `Got it — *${formatDate(intent.date)}*. ${staffNote}` +
+                formatConfirmationPrompt(pendingBooking, businessType);
+              nextState = STATES.AWAITING_CONFIRMATION;
+              lastStepDescriptionForNudge = 'Waiting for them to confirm the booking we proposed.';
+            } else {
+              await updateSession(phone, businessId, STATES.AWAITING_NAME, {
+                ...temp, date: intent.date, staffId: staffIdForDate,
+                staffName: staffNameForDate, pendingBooking,
+              });
+              reply = `Almost there! What name should we put the booking under?`;
+              nextState = STATES.AWAITING_NAME;
+              lastStepDescriptionForNudge = 'Asking for their name to complete the booking.';
+            }
+            break;
+          }
+
+          // Preferred time not available — show slots sorted nearest to preference
+          const prefMin = timeToMinutes(temp.time);
+          const byProximity = [...allSlots].sort((a, b) =>
+            Math.abs(timeToMinutes(a) - prefMin) - Math.abs(timeToMinutes(b) - prefMin)
+          );
+          const display = byProximity.slice(0, 6);
+          const reason = getTimeNotAvailableReason(temp.time, allSlots, temp.durationMinutes || 30);
+          await updateSession(phone, businessId, STATES.AWAITING_TIME, {
+            ...temp, date: intent.date, staffId: staffIdForDate,
+            staffName: staffNameForDate, displaySlots: display,
+          });
+          nextState = STATES.AWAITING_TIME;
+          lastStepDescriptionForNudge = `Showing available times on ${formatDate(intent.date)} for their booking.`;
+          reply = `Got it — *${formatDate(intent.date)}*.\n\n` +
+            `${staffNote}Your preferred time (*${formatTime(temp.time)}*) isn't available — ${reason}\n\n` +
+            formatSlotList(display, intent.date);
+          break;
+        }
+
+        // No time preference — show standard curated slot list
+        const display = curateSlots(allSlots, 6);
+        await updateSession(phone, businessId, STATES.AWAITING_TIME, {
+          ...temp, date: intent.date, staffId: staffIdForDate, staffName: staffNameForDate, displaySlots: display,
+        });
+        nextState = STATES.AWAITING_TIME;
+        lastStepDescriptionForNudge = `Showing available times on ${formatDate(intent.date)} for their booking.`;
+        reply = `Got it — *${formatDate(intent.date)}*.\n\n${staffNote}`;
+        reply += formatSlotList(display, intent.date);
+        break;
+      }
+
+      // ── AWAITING_TIME ─────────────────────────────────────────────────────
+      // Number lookup uses temp.displaySlots so "3" always maps to the 3rd slot
+      // that was actually shown, not the 3rd slot in the full availability list.
+      case STATES.AWAITING_TIME: {
+        const { date, staffId, serviceId, serviceName, durationMinutes, price } = temp;
+        const allSlots = await getAvailableSlots(businessId, date, staffId, durationMinutes || 30);
+
+        if (!allSlots.length) {
+          await updateSession(phone, businessId, STATES.AWAITING_DATE, { ...temp, displaySlots: null });
+          reply = `Sorry, no slots are available on *${formatDate(date)}*.\n\nWould you like to try a different date? Just tell me the date.`;
+          nextState = STATES.AWAITING_DATE;
+          lastStepDescriptionForNudge = `Asking them to pick another date because that day is full.`;
+          break;
+        }
+
+        const display   = temp.displaySlots?.length ? temp.displaySlots : curateSlots(allSlots, 6);
+        let exactMatch  = null;
+        const numPick   = parseInt(message.trim(), 10);
+
+        if (!isNaN(numPick) && numPick >= 1 && display[numPick - 1]) {
+          exactMatch = display[numPick - 1];
+        } else {
+          const intent = await extractBookingIntent(message, [], businessTZ);
+          if (intent.time) {
+            exactMatch = allSlots.find(s => s === intent.time);
+            if (!exactMatch) {
+              const newDisplay = curateSlots(allSlots, 6);
+              await updateSession(phone, businessId, STATES.AWAITING_TIME, {
+                ...temp, displaySlots: newDisplay,
+              });
+              const reason = getTimeNotAvailableReason(intent.time, allSlots, durationMinutes || 30);
+              reply = `Sorry, *${formatTime(intent.time)}* is not available on *${formatDate(date)}* — ${reason}\n\n` +
+                formatSlotList(newDisplay, date) +
+                `\n\nReply with a number or time from the list above.`;
+          nextState = STATES.AWAITING_TIME;
+          lastStepDescriptionForNudge = `Showing which times are actually available and asking them to pick one.`;
+              break;
+            }
+          }
+        }
+
+        // "Why isn't 10am available?" / "Why it's not available" etc. — answer instead of "I couldn't understand"
+        const isWhyQuestion = /why|how come|reason|why.*not|why it'?s? not|why is it not|explain/i.test(message.trim()) && message.trim().length < 80;
+        if (!exactMatch && isWhyQuestion) {
+          const firstSlot = (display[0] || allSlots[0]);
+          const lastSlot  = (display[display.length - 1] || allSlots[allSlots.length - 1]);
+          reply = `Those times are the only ones free on *${formatDate(date)}* — earlier ones may have passed or we're only open from *${formatTime(firstSlot)}* to *${formatTime(lastSlot)}* that day.\n\n` +
+            formatSlotList(display, date) +
+            `\n\nReply with a number or time from the list above.`;
+          nextState = STATES.AWAITING_TIME;
+          lastStepDescriptionForNudge = `Explaining why a time isn't available and re-listing the open slots.`;
+          break;
+        }
+
+        if (!exactMatch) {
+          reply = `I couldn't understand that. Please reply with a slot number or time (e.g. "1" or "10am").\n\n` +
+            formatSlotList(display, date);
+          nextState = STATES.AWAITING_TIME;
+          lastStepDescriptionForNudge = `Waiting for them to choose one of the suggested times.`;
+          break;
+        }
+
+        const staff       = await getStaff(businessId);
+        const staffMember = staff.find(s => s.id === staffId) || staff[0];
+        if (!staffMember) {
+          reply = `Sorry, this business hasn't set up their team yet. Please check back soon!`;
+          await resetSession(phone, businessId);
+          nextState = STATES.IDLE;
+          break;
+        }
+
+        const resolvedName   = temp.customerName || savedName || null;
+        const pendingBooking = {
+          businessId, staffId: staffMember.id, serviceId, serviceName,
+          staffName: staffMember.name, customerPhone: phone, customerName: resolvedName,
+          date, time: exactMatch, durationMinutes: durationMinutes || 30, price,
+        };
+
+        if (resolvedName) {
+          await updateSession(phone, businessId, STATES.AWAITING_CONFIRMATION, {
+            ...temp, time: exactMatch, pendingBooking,
+          });
+          nextState = STATES.AWAITING_CONFIRMATION;
+          lastStepDescriptionForNudge = 'Waiting for them to confirm the booking we just proposed.';
+          reply = formatConfirmationPrompt(pendingBooking, businessType);
+        } else {
+          await updateSession(phone, businessId, STATES.AWAITING_NAME, {
+            ...temp, time: exactMatch, pendingBooking,
+          });
+          nextState = STATES.AWAITING_NAME;
+          lastStepDescriptionForNudge = 'Asking for their name to finish the booking.';
+          reply = `Almost there! What name should we put the booking under?`;
+        }
+        break;
+      }
+
+      // ── AWAITING_STAFF ────────────────────────────────────────────────────
+      case STATES.AWAITING_STAFF: {
+        const staffList = temp.staffList || [];
+        const idx       = parseInt(message, 10) - 1;
+        let chosen      = null;
+
+        if (message.toLowerCase() === 'any') {
+          chosen = staffList[0];
+        } else if (!isNaN(idx) && idx >= 0 && staffList[idx]) {
+          chosen = staffList[idx];
+        } else {
+          chosen = staffList.find(s => s.name.toLowerCase().includes(message.toLowerCase()));
+        }
+
+        if (!chosen) {
+          reply = formatError("I didn't recognise that name.") + '\n\n' + formatStaffList(staffList);
+          break;
+        }
+        await updateSession(phone, businessId, STATES.AWAITING_DATE, {
+          ...temp, staffId: chosen.id, staffName: chosen.name,
+        });
+        nextState = STATES.AWAITING_DATE;
+        lastStepDescriptionForNudge = `Booking with ${chosen.name} and asking which date works.`;
+        reply = `Great! Booking with *${chosen.name}*.\n\nWhat date works for you?`;
+        break;
+      }
+
+      // ── AWAITING_RESCHEDULE_WHICH ─────────────────────────────────────────
+      case STATES.AWAITING_RESCHEDULE_WHICH: {
+        const appointments = temp.appointments || [];
+        const idx          = parseInt(message, 10) - 1;
+        let chosen         = Number.isFinite(idx) && idx >= 0 ? appointments[idx] : null;
+
+        // Fuzzy text match — service name or date string
+        if (!chosen) {
+          const q = message.toLowerCase().trim();
+          chosen = appointments.find(a =>
+            a.service_name?.toLowerCase().includes(q) ||
+            formatDateTime(a.scheduled_at, businessTZ).toLowerCase().includes(q)
+          );
+        }
+
+        if (!chosen) {
+          const list = appointments.map((a, i) =>
+            `  ${i + 1}. *${a.service_name}* — ${formatDateTime(a.scheduled_at, businessTZ)}`
+          ).join('\n');
+          reply = `I didn't recognise that. Which appointment would you like to reschedule?\n\n${list}\n\nReply with the *number* or the service name.`;
+          break;
+        }
+        await updateSession(phone, businessId, STATES.AWAITING_RESCHEDULE_DATE, {
+          ...temp, rescheduleAppt: chosen,
+        });
+        nextState = STATES.AWAITING_RESCHEDULE_DATE;
+        lastStepDescriptionForNudge = 'Asking which new date they want for the reschedule.';
+        reply = `Got it. What new date would you like for your *${chosen.service_name}* appointment?\n(e.g. "Friday", "March 5")`;
+        break;
+      }
+
+      // ── AWAITING_RESCHEDULE_DATE ──────────────────────────────────────────
+      case STATES.AWAITING_RESCHEDULE_DATE: {
+        const intent = await extractRescheduleIntent(message, businessTZ);
+        if (!intent.date) {
+          reply = `I couldn't understand that date. Please try again (e.g. "Friday", "March 5").`;
+          break;
+        }
+        const { rescheduleAppt } = temp;
+        const allSlots = await getAvailableSlots(
+          businessId, intent.date, rescheduleAppt.staff_id, rescheduleAppt.duration_minutes || 30,
+        );
+        if (!allSlots.length) {
+          reply = `Sorry, no slots on *${formatDate(intent.date)}*. Try another date?`;
+          break;
+        }
+        const display = curateSlots(allSlots, 6);
+        await updateSession(phone, businessId, STATES.AWAITING_RESCHEDULE_TIME, {
+          ...temp, rescheduleDate: intent.date, displaySlots: display,
+        });
+        nextState = STATES.AWAITING_RESCHEDULE_TIME;
+        lastStepDescriptionForNudge = 'Showing new times for their rescheduled appointment and waiting for a choice.';
+        reply = `Got it — *${formatDate(intent.date)}*.\n\n` + formatSlotList(display, intent.date);
+        break;
+      }
+
+      // ── AWAITING_RESCHEDULE_TIME ──────────────────────────────────────────
+      case STATES.AWAITING_RESCHEDULE_TIME: {
+        const { rescheduleAppt, rescheduleDate } = temp;
+        const allSlots = await getAvailableSlots(
+          businessId, rescheduleDate, rescheduleAppt.staff_id, rescheduleAppt.duration_minutes || 30,
+        );
+        const display     = temp.displaySlots?.length ? temp.displaySlots : curateSlots(allSlots, 6);
+        let exactMatch    = null;
+        const slotIdx     = parseInt(message, 10) - 1;
+
+        if (!isNaN(slotIdx) && slotIdx >= 0 && display[slotIdx]) {
+          exactMatch = display[slotIdx];
+        } else {
+          const intent = await extractRescheduleIntent(message, businessTZ);
+          if (intent.time) {
+            exactMatch = allSlots.find(s => s === intent.time);
+          }
+        }
+
+        if (!exactMatch) {
+          reply = `I couldn't understand that time. Please pick from the list.\n\n` +
+            formatSlotList(display, rescheduleDate);
+          break;
+        }
+        if (!allSlots.find(s => s === exactMatch)) {
+          const newDisplay = curateSlots(allSlots, 6);
+          reply = `Sorry, *${formatTime(exactMatch)}* is not available.\n\n` +
+            formatSlotList(newDisplay, rescheduleDate);
+          break;
+        }
+
+        await updateSession(phone, businessId, STATES.AWAITING_RESCHEDULE_CONFIRM, {
+          ...temp, rescheduleTime: exactMatch,
+        });
+        nextState = STATES.AWAITING_RESCHEDULE_CONFIRM;
+        lastStepDescriptionForNudge = 'Waiting for them to confirm the new rescheduled time.';
+        reply = `Please confirm the reschedule:\n\n` +
+          `Service: ${rescheduleAppt.service_name}\n` +
+          `New Date: ${formatDate(rescheduleDate)}\n` +
+          `New Time: ${formatTime(exactMatch)}\n\n` +
+          `Reply *YES* to confirm or *NO* to cancel.`;
+        break;
+      }
+
+      // ── AWAITING_RESCHEDULE_CONFIRM ───────────────────────────────────────
+      case STATES.AWAITING_RESCHEDULE_CONFIRM: {
+        const answer = await extractConfirmation(message);
+        if (answer === 'yes') {
+          const { rescheduleAppt, rescheduleDate, rescheduleTime } = temp;
+          const updated = await rescheduleAppointment(rescheduleAppt.id, phone, rescheduleDate, rescheduleTime, businessTZ);
+          if (updated) {
+            reply = formatRescheduleConfirmed({
+              serviceName:   rescheduleAppt.service_name,
+              staffName:     rescheduleAppt.staff_name,
+              date:          rescheduleDate,
+              time:          rescheduleTime,
+              appointmentId: rescheduleAppt.id,
+              businessType,
+            });
+          } else {
+            reply = formatError('Could not reschedule. The appointment may have already been cancelled.');
+          }
+          await resetSession(phone, businessId);
+          nextState = STATES.IDLE;
+        } else if (answer === 'no') {
+          reply = `✅ Reschedule cancelled. Type *HELP* to start over.`;
+          await resetSession(phone, businessId);
+          nextState = STATES.IDLE;
+        } else {
+          reply = 'Please reply *YES* to confirm or *NO* to cancel.';
+          nextState = STATES.AWAITING_RESCHEDULE_CONFIRM;
+          lastStepDescriptionForNudge = 'Waiting for YES or NO to confirm the reschedule.';
+        }
+        break;
+      }
+
+      // ── AWAITING_CANCEL_WHICH ─────────────────────────────────────────────
+      case STATES.AWAITING_CANCEL_WHICH: {
+        const appointments = temp.appointments || [];
+        const idx          = parseInt(message, 10) - 1;
+        let chosen         = Number.isFinite(idx) && idx >= 0 ? appointments[idx] : null;
+
+        // "NO" / "keep it" → abort cancel
+        if (/^(no|nope|nahi|keep|cancel cancel|never mind|nevermind)$/i.test(message.trim())) {
+          reply = `No problem! Your appointment is safe. Type *HELP* if you need anything. 😊`;
+          await resetSession(phone, businessId);
+          break;
+        }
+
+        // Fuzzy text match — service name or date string
+        if (!chosen) {
+          const q = message.toLowerCase().trim();
+          chosen = appointments.find(a =>
+            a.service_name?.toLowerCase().includes(q) ||
+            formatDateTime(a.scheduled_at, businessTZ).toLowerCase().includes(q)
+          );
+        }
+
+        if (!chosen) {
+          const list = appointments.map((a, i) =>
+            `  ${i + 1}. *${a.service_name}* — ${formatDateTime(a.scheduled_at, businessTZ)}`
+          ).join('\n');
+          reply = `I didn't recognise that. Which appointment would you like to cancel?\n\n${list}\n\nReply with the *number* or the service name.`;
+          break;
+        }
+        const cancelled = await cancelAppointment(chosen.id, phone);
+        reply = cancelled
+          ? formatCancellationConfirmed(chosen, businessType, businessTZ)
+          : formatError('Could not cancel that appointment. It may have already been cancelled.');
+        await resetSession(phone, businessId);
+        nextState = STATES.IDLE;
+        break;
+      }
+
+      // ── IDLE: classify intent ─────────────────────────────────────────────
+      default: {
+        // Fast-path: post-action acknowledgements ("Great!", "Thanks", "Perfect")
+        // User is just reacting to something that succeeded — no LLM, no booking pitch.
+        if (KEYWORD_ACK.test(message.trim())) {
+          const acks = [
+            `Glad I could help! 😊 Let me know if you need anything else.`,
+            `Of course! Feel free to reach out anytime. 😊`,
+            `Happy to help! Type *HELP* if you ever need anything. 😊`,
+            `You're welcome! Come back anytime. 😊`,
+          ];
+          reply = acks[Math.floor(Math.random() * acks.length)];
+          break;
+        }
+
+        // Fast-path: obvious gibberish (keyboard mash, pure repeats) — no LLM needed
+        if (looksLikeGibberish(message)) {
+          try {
+            reply = await answerConversational(message, {
+              name: businessName, type: businessType,
+            });
+          } catch {
+            reply = formatNotUnderstood();
+          }
+          break;
+        }
+
+        const idleServices = await getServices(businessId);
+
+        // Single LLM call returns both handoff flag AND intent (halves latency vs two calls)
+        const classification = await classifyMessage(message, idleServices.map(s => s.name));
+        const wantsHuman = classification.handoff;
+        let intent = classification.intent;
+
+        if (wantsHuman) {
+          await updateSession(phone, businessId, STATES.AWAITING_HANDOFF, {});
+          reply = formatHandoffMessage(businessName);
+          console.log(`[Handoff] ${phone} (biz ${businessId}) requested a human agent`);
+          break;
+        }
+
+        // Override: "remind me at X" → reminder (catches LLM misclassifications like "book")
+        // Exclude "reschedule" so "remind me to reschedule" stays correct
+        if (intent !== 'reschedule' && KEYWORD_REMINDER_OVERRIDE.test(message)) {
+          intent = 'reminder';
+        }
+
+        // If LLM said "none" but message clearly asks for "my bookings", treat as my_appointments
+        if (intent === 'none' && !/^cancel\s+/i.test(msgNorm) && (KEYWORD_MY_BOOKINGS.test(msgNorm) || CONTAINS_MY_BOOKINGS.test(msgNorm))) {
+          intent = 'my_appointments';
+        }
+
+        if (intent === 'help') {
+          try {
+            const dynamicHelp = await generateHelpReply({
+              businessName,
+              businessType,
+              services: idleServices,
+              customerName: savedName || null,
+            });
+            reply = dynamicHelp || formatWelcome(businessName, idleServices, savedName, businessType);
+          } catch (err) {
+            console.error('[Webhook] generateHelpReply (intent=help) failed:', err.message);
+            reply = formatWelcome(businessName, idleServices, savedName, businessType);
+          }
+          break;
+        }
+
+        if (intent === 'my_appointments') {
+          try {
+            const appointments = await getUpcomingAppointments(phone, businessId);
+            reply = formatAppointmentList(appointments, savedName, businessType, businessTZ);
+          } catch (err) {
+            console.error('[Webhook] my_appointments failed:', err.message);
+            reply = formatFriendlyFallback('Could not load your bookings right now. Please try again in a moment.');
+          }
+          break;
+        }
+
+        if (intent === 'reschedule') {
+          const appointments = await getUpcomingAppointments(phone, businessId);
+          if (!appointments.length) {
+            reply = `You have no upcoming appointments to reschedule.`;
+          } else if (appointments.length === 1) {
+            await updateSession(phone, businessId, STATES.AWAITING_RESCHEDULE_DATE, {
+              rescheduleAppt: appointments[0],
+            });
+            reply = `What new date would you like for your *${appointments[0].service_name}* appointment?\n(e.g. "Friday", "March 5")`;
+          } else {
+            const list = appointments.map((a, i) =>
+              `${i + 1}. *${a.service_name}* — ${formatDateTime(a.scheduled_at, businessTZ)}`
+            ).join('\n');
+            reply = `Which appointment would you like to reschedule?\n\n${list}\n\nReply with the number.`;
+            await updateSession(phone, businessId, STATES.AWAITING_RESCHEDULE_WHICH, { appointments });
+          }
+          break;
+        }
+
+        if (intent === 'availability') {
+          const availQuery     = await extractAvailabilityQuery(message, businessTZ);
+          const services       = await getServices(businessId);
+          const defaultDuration = services[0]?.duration_minutes || 30;
+          const staffList      = await getStaff(businessId);
+          const defaultStaffId = staffList[0]?.id;
+          let daysWithSlots;
+          if (availQuery.type === 'day' && availQuery.date) {
+            const slots = defaultStaffId
+              ? await getAvailableSlots(businessId, availQuery.date, defaultStaffId, defaultDuration)
+              : [];
+            daysWithSlots = slots.length ? [{ date: availQuery.date, slots }] : [];
+          } else {
+            const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: businessTZ });
+            const endDate  = new Date(todayStr + 'T12:00:00');
+            endDate.setDate(endDate.getDate() + 13);
+            const endStr   = endDate.toLocaleDateString('en-CA', { timeZone: businessTZ });
+            const allDays  = await getAvailableSlotsForRange(businessId, todayStr, endStr, defaultDuration);
+            daysWithSlots  = allDays.slice(0, 5);
+          }
+          reply = formatAvailabilitySummary(daysWithSlots, businessType);
+          break;
+        }
+
+        if (intent === 'cancel') {
+          const appointments = await getUpcomingAppointments(phone, businessId);
+          if (!appointments.length) {
+            reply = `You have no upcoming appointments to cancel. 😊\n\nWant to book one? Just tell me the service and date!`;
+          } else if (appointments.length === 1) {
+            const appt = appointments[0];
+            await updateSession(phone, businessId, STATES.AWAITING_CANCEL_WHICH, { appointments });
+            reply = `I found your upcoming appointment:\n\n📋 *${appt.service_name}* — ${formatDateTime(appt.scheduled_at, businessTZ)}\n\nReply *1* to cancel it, or *NO* to keep it.`;
+          } else {
+            const msgLower = message.toLowerCase();
+            const autoMatch = appointments.find(a =>
+              a.service_name?.toLowerCase().includes(msgLower.replace(/cancel\s*/i, '').trim()) ||
+              formatDateTime(a.scheduled_at, businessTZ).toLowerCase().includes(msgLower.replace(/cancel\s*/i, '').trim())
+            );
+            if (autoMatch) {
+              await updateSession(phone, businessId, STATES.AWAITING_CANCEL_WHICH, { appointments });
+              const matchIdx = appointments.indexOf(autoMatch) + 1;
+              reply = `I found this appointment:\n\n📋 *${autoMatch.service_name}* — ${formatDateTime(autoMatch.scheduled_at, businessTZ)}\n\nReply *${matchIdx}* to cancel it, or *NO* to keep it.`;
+            } else {
+              const list = appointments.map((a, i) =>
+                `  ${i + 1}. *${a.service_name}* — ${formatDateTime(a.scheduled_at, businessTZ)}`
+              ).join('\n');
+              reply = `Which appointment would you like to cancel?\n\n${list}\n\nReply with the number.`;
+              await updateSession(phone, businessId, STATES.AWAITING_CANCEL_WHICH, { appointments });
+            }
+          }
+          break;
+        }
+
+        if (intent === 'book') {
+          const services    = idleServices.length ? idleServices : await getServices(businessId);
+          const staffList   = await getStaff(businessId);
+          const defaultStaff = staffList[0];
+
+          if (!staffList.length) {
+            reply = `Sorry, this business hasn't set up their team yet. Please check back soon!`;
+            break;
+          }
+          if (!services.length) {
+            reply = `Sorry, this business hasn't added any services yet. Please check back soon!`;
+            break;
+          }
+
+          const bookIntent = await extractBookingIntent(message, services.map(s => s.name), businessTZ);
+
+          let service = null;
+          if (bookIntent.service) {
+            service = await findService(businessId, bookIntent.service);
+          }
+
+          // "Book the same again" / "rebook" — look up their last booked service
+          if (!service && KEYWORD_SAME_SERVICE.test(message)) {
+            const lastSvc = await getLastBookedService(phone, businessId);
+            if (lastSvc?.active !== false) {
+              service = services.find(s => s.id === lastSvc?.service_id)
+                     || services.find(s => s.name.toLowerCase() === lastSvc?.service_name?.toLowerCase());
+              if (service) {
+                console.log(`[Booking] ${phone} rebooking last service: ${service.name}`);
+              }
+            }
+          }
+
+          if (!service) {
+            await updateSession(phone, businessId, STATES.AWAITING_SERVICE, {
+              services,
+              staffId: defaultStaff?.id,
+              date:    bookIntent.date || null,
+              time:    bookIntent.time || null,
+            });
+            nextState = STATES.AWAITING_SERVICE;
+            lastStepDescriptionForNudge = 'Showing the list of services and waiting for them to pick one.';
+            reply = formatServiceList(services, businessType);
+            break;
+          }
+
+          let staffMember = defaultStaff;
+          if (bookIntent.staffName) {
+            const found = staffList.find(s =>
+              s.name.toLowerCase().includes(bookIntent.staffName.toLowerCase())
+            );
+            if (found) staffMember = found;
+          }
+
+          if (bookIntent.date) {
+            const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: businessTZ });
+            if (bookIntent.date < todayStr) {
+              await updateSession(phone, businessId, STATES.AWAITING_DATE, {
+                serviceId: service.id, serviceName: service.name,
+                durationMinutes: service.duration_minutes, price: service.price,
+                staffId: staffMember.id, staffName: staffMember.name,
+              });
+              reply = `Sorry, I can't book in the past! 😅\n\n*${service.name}* is selected. What date works for you? (e.g. "tomorrow", "Monday")`;
+              break;
+            }
+          }
+
+          if (bookIntent.date && bookIntent.time) {
+            const allSlots = await getAvailableSlots(
+              businessId, bookIntent.date, staffMember.id, service.duration_minutes,
+            );
+            if (!allSlots.length) {
+              await updateSession(phone, businessId, STATES.AWAITING_DATE, {
+                serviceId: service.id, serviceName: service.name,
+                durationMinutes: service.duration_minutes, price: service.price,
+                staffId: staffMember.id, staffName: staffMember.name,
+              });
+              reply = `Sorry, no slots are available on *${formatDate(bookIntent.date)}*. What other date works for you?`;
+              break;
+            }
+            const exactMatch = allSlots.find(s => s === bookIntent.time);
+            if (!exactMatch) {
+              const display = curateSlots(allSlots, 6);
+              await updateSession(phone, businessId, STATES.AWAITING_TIME, {
+                serviceId: service.id, serviceName: service.name,
+                durationMinutes: service.duration_minutes, price: service.price,
+                staffId: staffMember.id, staffName: staffMember.name,
+                date: bookIntent.date, displaySlots: display,
+              });
+              reply = `Sorry, *${formatTime(bookIntent.time)}* is not available on *${formatDate(bookIntent.date)}*.\n\n` +
+                formatSlotList(display, bookIntent.date) +
+                `\n\nReply with a time from the list above.`;
+              nextState = STATES.AWAITING_TIME;
+              lastStepDescriptionForNudge = 'Showing which times are available and waiting for them to choose.';
+              break;
+            }
+            const pendingBooking = {
+              businessId,
+              staffId:       staffMember.id,
+              serviceId:     service.id,
+              serviceName:   service.name,
+              staffName:     staffMember.name,
+              customerPhone: phone,
+              customerName:  savedName,
+              date:          bookIntent.date,
+              time:          exactMatch,
+              durationMinutes: service.duration_minutes,
+              price:         service.price,
+            };
+            if (savedName) {
+              await updateSession(phone, businessId, STATES.AWAITING_CONFIRMATION, { pendingBooking });
+              reply = formatConfirmationPrompt(pendingBooking, businessType);
+              nextState = STATES.AWAITING_CONFIRMATION;
+              lastStepDescriptionForNudge = 'Waiting for them to confirm the booking we proposed.';
+            } else {
+              await updateSession(phone, businessId, STATES.AWAITING_NAME, { pendingBooking });
+              reply = `Almost there! What name should we put the booking under?`;
+              nextState = STATES.AWAITING_NAME;
+              lastStepDescriptionForNudge = 'Asking for their name to finish the booking.';
+            }
+            break;
+          }
+
+          const newTemp = {
+            serviceId: service.id, serviceName: service.name,
+            durationMinutes: service.duration_minutes, price: service.price,
+            staffId: staffMember.id, staffName: staffMember.name,
+            date: bookIntent.date || null,
+            time: bookIntent.time || null,
+          };
+
+          if (!bookIntent.date) {
+            // ── Smart suggestion: no date given — find the next available slot ───
+            const suggested = bookIntent.time
+              ? await findNextSlotNearTime(businessId, staffMember.id, service.duration_minutes, bookIntent.time, businessTZ)
+              : null;
+
+            if (suggested) {
+              const pendingBooking = {
+                businessId, staffId: staffMember.id,
+                serviceId: service.id, serviceName: service.name,
+                staffName: staffMember.name,
+                customerPhone: phone, customerName: savedName,
+                date: suggested.date, time: suggested.time,
+                durationMinutes: service.duration_minutes, price: service.price,
+              };
+              if (savedName) {
+                await updateSession(phone, businessId, STATES.AWAITING_CONFIRMATION, {
+                  ...newTemp, date: suggested.date, time: suggested.time, pendingBooking,
+                });
+                reply = `How about *${service.name}* on *${formatDate(suggested.date)}* at *${formatTime(suggested.time)}*? 😊\n\n` +
+                  formatConfirmationPrompt(pendingBooking, businessType);
+                nextState = STATES.AWAITING_CONFIRMATION;
+                lastStepDescriptionForNudge = 'Suggested a smart slot and waiting for them to confirm.';
+              } else {
+                await updateSession(phone, businessId, STATES.AWAITING_NAME, {
+                  ...newTemp, date: suggested.date, time: suggested.time, pendingBooking,
+                });
+                reply = `How about *${service.name}* on *${formatDate(suggested.date)}* at *${formatTime(suggested.time)}*? 😊\n\nJust tell me the name for the booking!`;
+                nextState = STATES.AWAITING_NAME;
+                lastStepDescriptionForNudge = 'Suggested a smart slot and asking for their name.';
+              }
+            } else {
+              // No slot near preference found — fall back to asking for a date
+              const noSlotNote = bookIntent.time
+                ? `I couldn't find any *${formatTime(bookIntent.time)}* slots in the next week. `
+                : '';
+              await updateSession(phone, businessId, STATES.AWAITING_DATE, newTemp);
+              reply = `Great! *${service.name}* selected.\n\n${noSlotNote}What date works for you? (e.g. "tomorrow", "Friday", "Dec 20")`;
+              nextState = STATES.AWAITING_DATE;
+              lastStepDescriptionForNudge = `Asking which date works for their *${service.name}* booking.`;
+            }
+          } else {
+            const allSlots = await getAvailableSlots(
+              businessId, bookIntent.date, staffMember.id, service.duration_minutes,
+            );
+            if (!allSlots.length) {
+              await updateSession(phone, businessId, STATES.AWAITING_DATE, newTemp);
+              reply = `Sorry, no slots on *${formatDate(bookIntent.date)}*. What other date works?`;
+              nextState = STATES.AWAITING_DATE;
+              lastStepDescriptionForNudge = `Asking them to pick another date because that day is full.`;
+            } else {
+              const display = curateSlots(allSlots, 6);
+              await updateSession(phone, businessId, STATES.AWAITING_TIME, { ...newTemp, displaySlots: display });
+              reply = `Got it — *${formatDate(bookIntent.date)}*.\n\n` + formatSlotList(display, bookIntent.date);
+              nextState = STATES.AWAITING_TIME;
+              lastStepDescriptionForNudge = `Showing free times on ${formatDate(bookIntent.date)} and waiting for them to choose.`;
+            }
+          }
+          break;
+        }
+
+        if (intent === 'reminder') {
+          try {
+            // Parse the time (and optional date) from the message
+            const ri = await extractBookingIntent(message, [], businessTZ);
+
+            if (!ri.time) {
+              reply = `I automatically send you a reminder 24 hours before every appointment — no need to ask! 😊\n\nIf you'd like a reminder at a specific time, just tell me the time (e.g. "remind me at 7pm today").`;
+              break;
+            }
+
+            const todayStr   = new Date().toLocaleDateString('en-CA', { timeZone: businessTZ });
+            const targetDate = ri.date || todayStr;
+
+            // Convert the reminder time (expressed in business timezone) to a true UTC Date
+            const reminderAt = localToUTC(targetDate, ri.time, businessTZ);
+            const delayMs    = reminderAt.getTime() - Date.now();
+
+            if (delayMs <= 0) {
+              reply = `That time has already passed! 😅\n\nWould you like me to remind you at a different time today?`;
+              break;
+            }
+
+            if (delayMs > 24 * 60 * 60 * 1000) {
+              reply = `That's more than 24 hours away — I already send an automatic reminder 24 hours before every appointment, so you're covered! 😊`;
+              break;
+            }
+
+            const upcomingAppts = await getUpcomingAppointments(phone, businessId);
+            const apptRef       = upcomingAppts[0];
+
+            const reminderBody = apptRef
+              ? `⏰ *Reminder!*\n\nYou have an upcoming appointment:\n\nService: ${apptRef.service_name || 'Appointment'}\nDate: ${formatDateTime(apptRef.scheduled_at, businessTZ)}\n\nReply *CANCEL* or *RESCHEDULE* if needed. See you soon! 😊`
+              : `⏰ *Reminder!*\n\nThis is your custom reminder from appointbot. 😊`;
+
+            setTimeout(async () => {
+              try {
+                await sendWhatsAppText(phone, reminderBody, businessId);
+                console.log(`[Reminder] Custom reminder sent to ${phone} (biz ${businessId}) at ${new Date().toISOString()}`);
+              } catch (err) {
+                console.error(`[Reminder] Custom reminder failed for ${phone} (biz ${businessId}):`, err.message);
+              }
+            }, delayMs);
+
+            reply = `✅ Got it! I'll remind you at *${formatTime(ri.time)}* today.\n\nYour automatic 24-hour reminder before the appointment is still set too. 😊`;
+          } catch (reminderErr) {
+            console.error('[Webhook] Reminder intent failed:', reminderErr.message);
+            // Never send "hiccup" for reminder — confirm they're covered by automatic reminders
+            reply = `You're all set! I automatically send you a reminder 24 hours before each appointment, so you'll get one before your next visit. 😊\n\nIf you'd like a reminder at a specific time, just say the time (e.g. "remind me at 7pm today").`;
+          }
+          break;
+        }
+
+        if (intent === 'contact') {
+          const contactPhone = process.env.BUSINESS_CONTACT_PHONE || '';
+          reply = contactPhone
+            ? `📞 You can reach us at *${contactPhone}*.\n\nOr just reply here and we'll get back to you!`
+            : `Please visit us in person or check our website for contact details.`;
+          break;
+        }
+
+        // FAQ / conversational / unknown — always give a real, helpful answer
+        try {
+          reply = await answerConversational(message, {
+            name:     businessName,
+            type:     business?.type,
+            services: idleServices.map(s => s.name).join(', '),
+          });
+        } catch (convErr) {
+          console.error('[Webhook] answerConversational failed:', convErr.message);
+          reply = formatNotUnderstood();
+        }
+        if (!reply || !reply.trim()) {
+          reply = formatNotUnderstood();
+        }
+        break;
+      }
+    }
+  } catch (err) {
+    console.error(`[Webhook] Error handling message from ${rawPhone} (biz ${explicitBusinessId}):`, err);
+    // Try lightweight recovery: if they asked for "my bookings", try to fulfill that
+    const msgNorm = normForKeywords(message);
+    if (!/^cancel\s+/i.test(msgNorm) && CONTAINS_MY_BOOKINGS.test(message || '')) {
+      try {
+      const [appointments, businessRec, savedNameRec] = await Promise.all([
+          getUpcomingAppointments(phone, businessId),
+          getBusiness(businessId),
+          getCustomerName(phone, businessId),
+        ]);
+        reply = formatAppointmentList(appointments, savedNameRec, businessRec?.type || null, businessRec?.timezone || null);
+      } catch (recoveryErr) {
+        console.error('[Webhook] Recovery (my bookings) failed:', recoveryErr.message);
+      }
+    }
+    if (!reply || !reply.trim()) {
+      try {
+        const businessRec = await getBusiness(businessId);
+        const dynamic = await generateDynamicFallbackReply({
+          userMessage: message,
+          businessName: businessRec?.name || 'us',
+          businessType: businessRec?.type || null,
+        });
+        reply = dynamic || formatFriendlyFallback("I hit a small hiccup on my end.");
+      } catch (fallbackErr) {
+        console.error('[Webhook] Dynamic fallback failed:', fallbackErr.message);
+        reply = formatFriendlyFallback("I hit a small hiccup on my end.");
+      }
+    }
+  }
+
+  // Never ghost: ensure we always send something human
+  if (!reply || !reply.trim()) {
+    try {
+      const businessRec = await getBusiness(businessId);
+      const dynamic = await generateDynamicFallbackReply({
+        userMessage: message,
+        businessName: businessRec?.name || 'us',
+        businessType: businessRec?.type || null,
+      });
+      reply = dynamic || formatNotUnderstood();
+    } catch {
+      reply = formatNotUnderstood();
+    }
+  }
+
+  // Schedule a gentle inactivity nudge for active flows
+  if (reply && nextState && nextState !== STATES.IDLE) {
+    scheduleInactivityNudge({
+      phone,
+      businessId,
+      businessName,
+      businessType,
+      lastStepDescription: lastStepDescriptionForNudge || 'Continuing their booking flow.',
+      baselineUpdatedAt: updatedAt,
+    });
+  }
+
+  return { reply, businessId };
+}
+
+// ─── Extract text or voice from Meta WhatsApp message (same pattern as sparebot) ─
+function extractMetaMessageContent(msg) {
+  const type = msg?.type;
+  if (type === 'text') return { text: msg?.text?.body || '' };
+  if (type === 'button') return { text: msg?.button?.text || '' };
+  if (type === 'interactive') {
+    const i = msg?.interactive || {};
+    const buttonTitle = i?.button_reply?.title;
+    const listTitle = i?.list_reply?.title;
+    return { text: buttonTitle || listTitle || '' };
+  }
+  if (type === 'audio') {
+    return { audioId: msg?.audio?.id, audioMimeType: msg?.audio?.mime_type };
+  }
+  return { text: '' };
+}
+
+// ─── POST /webhook ─────────────────────────────────────────────────────────────
+router.post('/', async (req, res) => {
+  // WhatsApp Cloud API payload
+  if (Array.isArray(req.body.entry)) {
+    try {
+      console.log('[Webhook] Incoming WhatsApp Cloud payload:', JSON.stringify(req.body, null, 2));
+      const entry    = req.body.entry[0];
+      const change   = entry?.changes?.[0];
+      const value    = change?.value;
+      const messages = value?.messages;
+
+      if (!messages || !messages.length) return res.sendStatus(200);
+
+      const msg      = messages[0];
+      const rawPhone = msg.from || '';
+      const displayNumber = value?.metadata?.display_phone_number || '';
+
+      const { text, audioId, audioMimeType } = extractMetaMessageContent(msg);
+      let message = String((text || '').trim());
+
+      if (!message && audioId) {
+        const businessId = displayNumber
+          ? ((await getBusinessByPhone(displayNumber))?.id ?? DEFAULT_BUSINESS_ID)
+          : DEFAULT_BUSINESS_ID;
+        const transcript = await transcribeMetaAudio(audioId, audioMimeType, businessId);
+        message = (transcript || '').trim();
+      }
+
+      if (!message) {
+        try {
+          const businessId = displayNumber
+            ? ((await getBusinessByPhone(displayNumber))?.id ?? DEFAULT_BUSINESS_ID)
+            : DEFAULT_BUSINESS_ID;
+          await sendWhatsAppText(
+            rawPhone,
+            "Sorry, I couldn't read that message. Please type what you need.",
+            businessId,
+          );
+        } catch (sendErr) {
+          console.error('[Webhook] Fallback send failed:', sendErr.message);
+        }
+        return res.sendStatus(200);
+      }
+
+      let reply;
+      let businessIdForSend = DEFAULT_BUSINESS_ID;
+      try {
+        const result = await handleMessage({
+          rawPhone,
+          message,
+          explicitBusinessId: null,
+          toNumberForRouting: displayNumber,
+        });
+        reply = result.reply;
+        businessIdForSend = result.businessId;
+      } catch (handleErr) {
+        console.error('[Webhook] handleMessage threw:', handleErr);
+        try {
+          let businessRec = displayNumber ? await getBusinessByPhone(displayNumber) : null;
+          if (!businessRec) businessRec = await getBusiness(DEFAULT_BUSINESS_ID).catch(() => ({}));
+          businessIdForSend = businessRec?.id ?? DEFAULT_BUSINESS_ID;
+          const dynamic = await generateDynamicFallbackReply({
+            userMessage: message,
+            businessName: businessRec?.name || 'us',
+            businessType: businessRec?.type || null,
+          });
+          reply = dynamic || formatFriendlyFallback("I hit a small hiccup on my end.");
+        } catch (fallbackErr) {
+          console.error('[Webhook] Dynamic fallback failed:', fallbackErr.message);
+          reply = formatFriendlyFallback("I hit a small hiccup on my end.");
+        }
+      }
+
+      try {
+        await sendWhatsAppText(rawPhone, reply || formatNotUnderstood(), businessIdForSend);
+      } catch (sendErr) {
+        console.error(`[Webhook] Outbound send failed (biz ${businessIdForSend}):`, sendErr.message);
+      }
+      return res.sendStatus(200);
+    } catch (err) {
+      console.error('[Webhook] Cloud API error:', err);
+      // Don't ghost: try to send a short apology if we have enough from the request
+      try {
+        const entry = req.body?.entry?.[0];
+        const value = entry?.changes?.[0]?.value;
+        const from = value?.messages?.[0]?.from;
+        const displayNumber = value?.metadata?.display_phone_number;
+        if (from) {
+          const businessId = displayNumber
+            ? ((await getBusinessByPhone(displayNumber))?.id ?? DEFAULT_BUSINESS_ID)
+            : DEFAULT_BUSINESS_ID;
+          await sendWhatsAppText(
+            from,
+            "Sorry, I hit a small hiccup. Please try again in a moment or type *HELP*. I'm here! 🙂",
+            businessId,
+          );
+        }
+      } catch (sendErr) {
+        console.error('[Webhook] Fallback send after error failed:', sendErr.message);
+      }
+      return res.sendStatus(200); // always acknowledge to prevent Meta retries
+    }
+  }
+
+  // Internal chat proxy / legacy JSON body
+  const rawPhone   = req.body.From  || req.body.phone  || 'test';
+  const body       = (req.body.Body || req.body.message || '').trim();
+  const buttonText = req.body.ButtonText || '';
+  const message    = buttonText || body;
+  const businessId = req.body.businessId;
+  const toNumber   = req.body.To || '';
+
+  console.log('[Webhook] Incoming chat proxy payload:', { rawPhone, body, buttonText, businessId, toNumber });
+
+  let reply;
+  try {
+    const result = await handleMessage({
+      rawPhone,
+      message,
+      explicitBusinessId: businessId,
+      toNumberForRouting: toNumber,
+    });
+    reply = result.reply;
+  } catch (err) {
+    console.error('[Webhook] Chat proxy handleMessage threw:', err);
+    try {
+      const businessRec = businessId
+        ? await getBusiness(businessId).catch(() => ({}))
+        : {};
+      const dynamic = await generateDynamicFallbackReply({
+        userMessage: message,
+        businessName: businessRec?.name || 'us',
+        businessType: businessRec?.type || null,
+      });
+      reply = dynamic || formatFriendlyFallback("I hit a small hiccup on my end.");
+    } catch (fallbackErr) {
+      reply = formatFriendlyFallback("I hit a small hiccup on my end.");
+    }
+  }
+  return res.type('text/plain').send(reply || formatNotUnderstood());
+});
+
+export default router;
