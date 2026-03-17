@@ -1,7 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import path from "path";
-import { fileURLToPath } from "url";
+import cors from "cors";
 
 import webhookRouter from "./routes/webhook.js";
 import chatRouter from "./routes/chat.js";
@@ -13,18 +12,16 @@ import whatsappConnectRouter from "./routes/whatsappConnect.js";
 import razorpayWebhookRouter from "./routes/razorpayWebhook.js";
 import { startReminderScheduler } from "./services/reminder.service.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true,
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
-app.use(express.static(path.join(__dirname, "../public")));
-
-// Serve React app (marketing + dashboard) from root
-const dashboardDist = path.join(__dirname, "../dashboard/dist");
-app.use(express.static(dashboardDist));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) =>
@@ -41,19 +38,6 @@ app.use("/webhook", razorpayWebhookRouter);
 app.use("/webhook", webhookRouter);
 app.use("/chat", chatRouter);
 app.use("/admin", adminRouter);
-
-// Catch-all: serve React app for any non-API route (client-side routing)
-app.get("*", (req, res, next) => {
-  if (
-    req.path.startsWith("/api") ||
-    req.path.startsWith("/webhook") ||
-    req.path.startsWith("/chat") ||
-    req.path.startsWith("/admin") ||
-    req.path.startsWith("/health")
-  )
-    return next();
-  res.sendFile(path.join(dashboardDist, "index.html"));
-});
 
 // ─── Global error handler ─────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
