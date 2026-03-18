@@ -345,3 +345,34 @@ export function formatNotUnderstood() {
     `Hmm, not sure I understood that. 🤔\n\nTry:\n_"Book a haircut tomorrow at 5pm"_\n_"Cancel my appointment"_\n_"What's free this week?"_\n\nOr type *HELP*.`,
   ]);
 }
+
+function stripExtraEmojis(s, maxEmojis = 2) {
+  if (!s || maxEmojis == null) return s;
+  let count = 0;
+  // Best-effort emoji detection; works well on Node versions that support Unicode property escapes.
+  const re = /\p{Extended_Pictographic}/gu;
+  return s.replace(re, (m) => {
+    count += 1;
+    return count <= maxEmojis ? m : '';
+  });
+}
+
+/**
+ * Enforce WhatsApp-friendly AI reply formatting.
+ * - No blank lines (no paragraphs)
+ * - Max N non-empty lines
+ * - Max M emojis
+ */
+export function formatShortWhatsAppReply(raw, { maxLines = 3, maxEmojis = 2 } = {}) {
+  const text = String(raw || '').replace(/\r\n/g, '\n').trim();
+  if (!text) return '';
+
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, Math.max(1, maxLines));
+
+  const compact = lines.join('\n').trim();
+  return stripExtraEmojis(compact, maxEmojis).trim();
+}

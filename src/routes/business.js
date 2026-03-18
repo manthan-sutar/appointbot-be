@@ -2,7 +2,16 @@ import express from 'express';
 import { query } from '../config/db.js';
 import { requireAuth, signToken } from '../middleware/auth.js';
 import { limitStaff, limitServices, PLAN_LIMITS } from '../middleware/planLimits.js';
-import { getTodaysAppointments, getUpcomingAppointments } from '../services/appointment.service.js';
+import {
+  cancelAppointmentById,
+  completeAppointmentById,
+  getAvailableSlots,
+  getBusiness,
+  getTodaysAppointments,
+  getUpcomingAppointments,
+  rescheduleAppointmentById,
+} from '../services/appointment.service.js';
+import { curateSlots } from '../utils/formatter.js';
 
 const router = express.Router();
 router.use(requireAuth);
@@ -349,6 +358,100 @@ router.get('/appointments', async (req, res) => {
   } catch (err) {
     console.error('[Appointments] Error:', err);
     res.status(500).json({ error: 'Failed to load appointments' });
+  }
+});
+
+// ─── GET /api/business/appointments/:id/slots ─────────────────────────────
+// Used for admin reschedule slot suggestions.
+router.get('/appointments/:id/slots', async (req, res) => {
+  const apptId = parseInt(req.params.id, 10);
+  const { date } = req.query; // YYYY-MM-DD
+
+  if (Number.isNaN(apptId)) return res.status(400).json({ error: 'Invalid appointment id' });
+  if (!date) return res.status(400).json({ error: 'date is required' });
+
+  try {
+    const { rows: apptRows } = await query(
+      `SELECT staff_id, duration_minutes, status
+       FROM appointments
+       WHERE id = $1 AND business_id = $2`,
+      [apptId, req.owner.businessId],
+    );
+
+    if (!apptRows.length) return res.status(404).json({ error: 'Appointment not found' });
+
+    const appt = apptRows[0];
+    if (appt.status !== 'confirmed') {
+      return res.status(409).json({ error: `Cannot reschedule a ${appt.status} appointment` });
+    }
+
+    const business = await getBusiness(req.owner.businessId);
+    const tz = business?.timezone || 'Asia/Kolkata';
+
+    const durationMinutes = appt.duration_minutes || 30;
+    const slots = await getAvailableSlots(req.owner.businessId, date, appt.staff_id, durationMinutes, tz);
+    return res.json({ slots, curatedSlots: curateSlots(slots, 6), timezone: tz });
+  } catch (err) {
+    console.error('[Appointment Slots] Error:', err);
+    res.status(500).json({ error: 'Failed to load available slots' });
+  }
+});
+
+// ─── POST /api/business/appointments/:id/cancel ──────────────────────────
+router.post('/appointments/:id/cancel', async (req, res) => {
+  const apptId = parseInt(req.params.id, 10);
+  if (Number.isNaN(apptId)) return res.status(400).json({ error: 'Invalid appointment id' });
+
+  try {
+    const appointment = await cancelAppointmentById(apptId, req.owner.businessId);
+    if (!appointment) {
+      return res.status(404).json({ error: 'Appointment not found or cannot be cancelled' });
+    }
+    return res.json({ appointment });
+  } catch (err) {
+    console.error('[Appointment Cancel] Error:', err);
+    return res.status(500).json({ error: 'Failed to cancel appointment' });
+  }
+});
+
+// ─── POST /api/business/appointments/:id/complete ────────────────────────
+router.post('/appointments/:id/complete', async (req, res) => {
+  const apptId = parseInt(req.params.id, 10);
+  if (Number.isNaN(apptId)) return res.status(400).json({ error: 'Invalid appointment id' });
+
+  try {
+    const appointment = await completeAppointmentById(apptId, req.owner.businessId);
+    if (!appointment) {
+      return res.status(404).json({ error: 'Appointment not found or cannot be completed' });
+    }
+    return res.json({ appointment });
+  } catch (err) {
+    console.error('[Appointment Complete] Error:', err);
+    return res.status(500).json({ error: 'Failed to mark appointment completed' });
+  }
+});
+
+// ─── POST /api/business/appointments/:id/reschedule ─────────────────────
+// Body: { date: "YYYY-MM-DD", time: "HH:MM" }
+router.post('/appointments/:id/reschedule', async (req, res) => {
+  const apptId = parseInt(req.params.id, 10);
+  const { date, time } = req.body || {};
+
+  if (Number.isNaN(apptId)) return res.status(400).json({ error: 'Invalid appointment id' });
+  if (!date || !time) return res.status(400).json({ error: 'date and time are required' });
+
+  try {
+    const appointment = await rescheduleAppointmentById(apptId, req.owner.businessId, date, time);
+    if (!appointment) {
+      return res.status(404).json({ error: 'Appointment not found or cannot be rescheduled' });
+    }
+    return res.json({ appointment });
+  } catch (err) {
+    if (err?.message === 'SLOT_TAKEN') {
+      return res.status(409).json({ error: 'That slot is not available', slots: err.slots || [] });
+    }
+    console.error('[Appointment Reschedule] Error:', err);
+    return res.status(500).json({ error: 'Failed to reschedule appointment' });
   }
 });
 

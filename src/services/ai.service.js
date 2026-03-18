@@ -5,10 +5,32 @@ const GROQ_MODEL    = process.env.GROQ_MODEL    || 'llama-3.3-70b-versatile';
 const OLLAMA_URL    = process.env.OLLAMA_URL    || 'http://localhost:11434';
 const OLLAMA_MODEL  = process.env.OLLAMA_MODEL  || 'llama3';
 
+const WHATSAPP_RECEPTIONIST_SYSTEM_PROMPT = `
+You are a human receptionist texting on WhatsApp for an appointment booking business.
+
+STRICT OUTPUT RULES (always follow):
+- Maximum 2–3 lines total. Never more than 3 non-empty lines.
+- No paragraphs: do NOT use blank lines. Use line breaks only.
+- One idea per message. Keep it punchy and direct.
+- Sound like a human receptionist texting, not a formal assistant or email.
+- Never use more than 2 emojis total.
+- Never repeat information already given in the conversation. Do not restate the business name/services unless the user asked again.
+- Get straight to the point. No filler phrases like:
+  "That's a great question", "I'd be happy to help", "Certainly", "Of course", "Absolutely",
+  "How may I assist you", "We offer ...", "Our staff are ready ...", "Feel free to ...".
+
+Formatting:
+- Prefer short lines.
+- If you need to give options, put each option on its own line.
+`.trim();
+
 // ─── LLM router ──────────────────────────────────────────────────────────────
 
-async function callLLM(prompt, { temperature = 0 } = {}) {
+async function callLLM(prompt, { temperature = 0, systemPrompt = null } = {}) {
   if (GROQ_API_KEY) {
+    const messages = systemPrompt
+      ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
+      : [{ role: 'user', content: prompt }];
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -17,7 +39,7 @@ async function callLLM(prompt, { temperature = 0 } = {}) {
       },
       body: JSON.stringify({
         model: GROQ_MODEL,
-        messages: [{ role: 'user', content: prompt }],
+        messages,
         temperature,
       }),
     });
@@ -26,10 +48,13 @@ async function callLLM(prompt, { temperature = 0 } = {}) {
   }
 
   // Ollama fallback
+  const fullPrompt = systemPrompt
+    ? `SYSTEM:\n${systemPrompt}\n\nUSER:\n${prompt}`.trim()
+    : prompt;
   const res = await fetch(`${OLLAMA_URL}/api/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: OLLAMA_MODEL, prompt, stream: false }),
+    body: JSON.stringify({ model: OLLAMA_MODEL, prompt: fullPrompt, stream: false }),
   });
   const data = await res.json();
   return data.response || '';
@@ -246,7 +271,7 @@ Return ONLY the JSON object.
 // Fast regex shortcuts that skip the LLM entirely for obvious cases.
 const HANDOFF_REGEX_FAST = /\b(human|person|agent|manager|owner|reception|real person|live (chat|support)|talk to (a |someone)|speak (to|with) (a |someone)|need help urgently)\b/i;
 
-const VALID_INTENTS = ['book', 'cancel', 'reschedule', 'reminder', 'my_appointments',
+const VALID_INTENTS = ['book', 'cancel', 'reschedule', 'repeat_booking', 'reminder', 'my_appointments',
   'availability', 'help', 'contact', 'faq', 'none'];
 
 export async function classifyMessage(message, serviceNames = []) {
@@ -264,7 +289,7 @@ You are a classifier for a WhatsApp appointment booking assistant.
 
 Given the user message, return a JSON object with EXACTLY two fields:
 - "handoff": true if the user wants to stop talking to the bot and speak to a real human, otherwise false
-- "intent": exactly one of: "book", "cancel", "reschedule", "reminder", "my_appointments", "availability", "help", "contact", "faq", "none"
+- "intent": exactly one of: "book", "cancel", "reschedule", "repeat_booking", "reminder", "my_appointments", "availability", "help", "contact", "faq", "none"
 
 ${servicesHint}
 User message: "${message}"
@@ -273,6 +298,7 @@ Intent rules:
 - "book" — wants to book/schedule, mentions a service name, OR mentions a date/time
 - "cancel" — cancel an existing appointment
 - "reschedule" — MOVE/CHANGE an existing appointment to a new date/time
+- "repeat_booking" — wants to BOOK A NEW appointment similar to the last one / same appointment again (do NOT modify existing booking). Trigger phrases include: "same appointment", "book again", "similar to last", "same one", "repeat booking", "one more like before", "same one next month"
 - "reminder" — wants the bot to NOTIFY them at a specific time (e.g. "remind me at 7pm", "send me a reminder"). NOT the same as reschedule.
 - "my_appointments" — wants to see their upcoming bookings
 - "availability" — asks what slots/times are free
@@ -428,7 +454,7 @@ Reply in 1-3 short sentences. Be warm and helpful. Guidelines:
 `.trim();
 
   try {
-    const answer = await callLLM(prompt);
+    const answer = await callLLM(prompt, { systemPrompt: WHATSAPP_RECEPTIONIST_SYSTEM_PROMPT });
     return answer?.trim() || "I can help you book appointments here! Type *HELP* to see what I can do. 😊";
   } catch {
     return "I can help you book appointments here! Type *HELP* to see what I can do. 😊";
@@ -465,7 +491,7 @@ Return ONLY the message text with no quotes or explanation.
 `.trim();
 
   try {
-    const text = await callLLM(prompt, { temperature: 0.7 });
+    const text = await callLLM(prompt, { temperature: 0.7, systemPrompt: WHATSAPP_RECEPTIONIST_SYSTEM_PROMPT });
     return text?.trim() ||
       "Still here whenever you’re ready 🙂 You can continue with your booking or type *HELP* to see options.";
   } catch {
@@ -510,7 +536,7 @@ Return ONLY the message text, no quotes or explanation.
 `.trim();
 
   try {
-    const text = await callLLM(prompt, { temperature: 0.6 });
+    const text = await callLLM(prompt, { temperature: 0.6, systemPrompt: WHATSAPP_RECEPTIONIST_SYSTEM_PROMPT });
     return text?.trim() || null;
   } catch {
     return null;
@@ -544,7 +570,7 @@ Return ONLY the message text.
 `.trim();
 
   try {
-    const text = await callLLM(prompt, { temperature: 0.7 });
+    const text = await callLLM(prompt, { temperature: 0.7, systemPrompt: WHATSAPP_RECEPTIONIST_SYSTEM_PROMPT });
     return text?.trim() || null;
   } catch {
     return null;
@@ -577,7 +603,7 @@ Be conversational. Do NOT use bullet lists. Return ONLY the message text, no quo
 `.trim();
 
   try {
-    const text = await callLLM(prompt, { temperature: 0.6 });
+    const text = await callLLM(prompt, { temperature: 0.6, systemPrompt: WHATSAPP_RECEPTIONIST_SYSTEM_PROMPT });
     return text?.trim() || null;
   } catch {
     return null;

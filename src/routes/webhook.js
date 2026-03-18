@@ -6,7 +6,7 @@ import {
   getServices, findService, getStaff, getAvailableSlots, getAvailableSlotsForRange,
   getFirstStaffWithSlotsOnDate, localToUTC, findNextSlotNearTime,
   bookAppointment, getUpcomingAppointments, cancelAppointment, rescheduleAppointment,
-  getLastBookedService,
+  getLastBookedService, getMostRecentAppointment,
   getCustomerName, upsertCustomer, getBusiness, getBusinessByPhone,
 } from '../services/appointment.service.js';
 import {
@@ -21,12 +21,18 @@ import {
   formatCancellationConfirmed, formatRescheduleConfirmed, formatAvailabilitySummary,
   formatHandoffMessage, formatError, formatNotUnderstood, formatFriendlyFallback,
   formatDate, formatTime, formatDateTime, timeToMinutes, getTimeNotAvailableReason,
+  formatShortWhatsAppReply,
 } from '../utils/formatter.js';
-import { sendWhatsAppText } from '../services/whatsapp.service.js';
+import { sendWhatsAppTemplate, sendWhatsAppText } from '../services/whatsapp.service.js';
 import { transcribeMetaAudio } from '../services/whisper.service.js';
 
 const router = express.Router();
 const DEFAULT_BUSINESS_ID = parseInt(process.env.DEFAULT_BUSINESS_ID || '1', 10);
+const GLOBAL_REMINDER_TEMPLATE =
+  process.env.WHATSAPP_REMINDER_TEMPLATE ||
+  process.env.WHATSAPP_REMINDER_TEMPLATE_NAME || // backward compat
+  '';
+const GLOBAL_REMINDER_TEMPLATE_LANG = process.env.WHATSAPP_REMINDER_TEMPLATE_LANG || 'en';
 
 // ─── Inactivity nudge scheduler (per phone+business) ─────────────────────────
 // After a few minutes of no reply mid-flow, send a gentle, AI-generated nudge.
@@ -51,7 +57,7 @@ function scheduleInactivityNudge({ phone, businessId, businessName, businessType
         businessType,
         lastStepDescription,
       });
-      await sendWhatsAppText(phone, message, businessId);
+      await sendWhatsAppText(phone, formatShortWhatsAppReply(message), businessId);
     } catch (err) {
       console.error('[Nudge] Failed to send inactivity nudge:', err.message);
     } finally {
@@ -117,7 +123,7 @@ const CONTAINS_MY_BOOKINGS = /\bmy\s+bookings?\b|\bmy\s+appointments?\b/i;
 const KEYWORD_REMINDER_OVERRIDE = /\b(remind\s+me|set\s+(a\s+)?reminder|send\s+(me\s+)?(a\s+)?reminder)\b/i;
 
 // "Book the same again" / "rebook" — pre-fill last booked service
-const KEYWORD_SAME_SERVICE = /\b(same\s+(as\s+)?(last|before|previous|usual|time)|book\s+(it\s+)?again|same\s+service|rebook|same\s+thing)\b/i;
+const KEYWORD_SAME_SERVICE = /\b(same\s+(as\s+)?(last|before|previous|usual|time)|book\s+(it\s+)?again|same\s+service|rebook|same\s+thing|same\s+appointment|similar\s+to\s+last|same\s+one|repeat\s+booking|one\s+more\s+like\s+before)\b/i;
 
 // Post-action acknowledgements — "Great!", "Thanks", "Perfect" etc.
 // Skip the LLM entirely; reply with a brief, context-free thank-you.
@@ -215,6 +221,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
           helpReply = await generateReturningUserGreeting({
             businessName, customerName: savedName, businessType, services,
           });
+          helpReply = formatShortWhatsAppReply(helpReply);
         } catch (err) {
           console.error('[Webhook] generateReturningUserGreeting failed:', err.message);
         }
@@ -226,6 +233,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
           helpReply = await generateHelpReply({
             businessName, businessType, services, customerName: savedName || null,
           });
+          helpReply = formatShortWhatsAppReply(helpReply);
         } catch (err) {
           console.error('[Webhook] generateHelpReply failed:', err.message);
         }
@@ -329,13 +337,23 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
               if (delayMs > 0) {
                 setTimeout(async () => {
                   try {
-                    const body =
-                      `⏰ *Reminder!*\n\n` +
-                      `Your *${pendingBooking.serviceName}* appointment is in 1 hour!\n\n` +
-                      `Staff: ${pendingBooking.staffName}\n` +
-                      `Time: ${formatTime(pendingBooking.time)}\n\n` +
-                      `See you soon! 😊`;
-                    await sendWhatsAppText(phone, body, businessId);
+                    const templateName = business?.whatsapp_reminder_template || GLOBAL_REMINDER_TEMPLATE;
+                    if (!templateName) throw new Error('No reminder template configured');
+                    const apptDate = formatDate(pendingBooking.date);
+                    const apptTime = formatTime(pendingBooking.time);
+                    await sendWhatsAppTemplate(
+                      phone,
+                      templateName,
+                      [
+                        pendingBooking.customerName || savedName || 'there',
+                        pendingBooking.serviceName || 'Appointment',
+                        apptDate,
+                        apptTime,
+                        businessName || 'us',
+                      ],
+                      businessId,
+                      GLOBAL_REMINDER_TEMPLATE_LANG,
+                    );
                     console.log(`[Reminder] 1-hour reminder sent to ${phone} (biz ${businessId})`);
                   } catch (e) {
                     console.error(`[Reminder] 1-hour reminder failed for ${phone}:`, e.message);
@@ -539,24 +557,40 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
           reply = `That date has already passed! 😅 Please pick a future date (e.g. "tomorrow", "next Monday").`;
           break;
         }
-        const staffList = await getStaff(businessId);
-        if (!staffList?.length) {
-          reply = `Sorry, this business hasn't set up their team yet. Please check back soon!`;
-          await resetSession(phone, businessId);
-          break;
-        }
         const duration = temp.durationMinutes || 30;
-        const result = await getFirstStaffWithSlotsOnDate(businessId, intent.date, duration, temp.staffId || null);
-        if (!result) {
-          reply = `Sorry, no slots are available on *${formatDate(intent.date)}*.\n\nWould you like to try a different date?`;
-          break;
+        let staffIdForDate = null;
+        let staffNameForDate = null;
+        let allSlots = [];
+        let staffNote = '';
+
+        // Repeat-booking flow: keep the same staff; do NOT silently switch.
+        if (temp.lockStaff && temp.staffId) {
+          staffIdForDate = temp.staffId;
+          staffNameForDate = temp.staffName || 'your staff member';
+          allSlots = await getAvailableSlots(businessId, intent.date, staffIdForDate, duration);
+          if (!allSlots.length) {
+            reply = `Sorry, *${staffNameForDate}* has no slots on *${formatDate(intent.date)}*.\n\nWhat other date works for you?`;
+            break;
+          }
+        } else {
+          const staffList = await getStaff(businessId);
+          if (!staffList?.length) {
+            reply = `Sorry, this business hasn't set up their team yet. Please check back soon!`;
+            await resetSession(phone, businessId);
+            break;
+          }
+          const result = await getFirstStaffWithSlotsOnDate(businessId, intent.date, duration, temp.staffId || null);
+          if (!result) {
+            reply = `Sorry, no slots are available on *${formatDate(intent.date)}*.\n\nWould you like to try a different date?`;
+            break;
+          }
+          ({ staffId: staffIdForDate, staffName: staffNameForDate, slots: allSlots } = result);
+          const preferredName = temp.staffName;
+          const usedDifferentStaff = preferredName && preferredName !== staffNameForDate;
+          staffNote = usedDifferentStaff
+            ? `*${preferredName}* isn't available that day. Here are slots with *${staffNameForDate}*:\n\n`
+            : '';
         }
-        const { staffId: staffIdForDate, staffName: staffNameForDate, slots: allSlots } = result;
-        const preferredName = temp.staffName;
-        const usedDifferentStaff = preferredName && preferredName !== staffNameForDate;
-        const staffNote = usedDifferentStaff
-          ? `*${preferredName}* isn't available that day. Here are slots with *${staffNameForDate}*:\n\n`
-          : '';
 
         // ── Honor stored time preference ────────────────────────────────────────
         if (temp.time) {
@@ -937,6 +971,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
             reply = await answerConversational(message, {
               name: businessName, type: businessType,
             });
+            reply = formatShortWhatsAppReply(reply);
           } catch {
             reply = formatNotUnderstood();
           }
@@ -968,6 +1003,12 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
           intent = 'my_appointments';
         }
 
+        // If LLM said "book" but the user clearly meant "book the same again", route to repeat_booking
+        // so we prefill *service + staff* from their most recent appointment.
+        if (intent === 'book' && KEYWORD_SAME_SERVICE.test(message)) {
+          intent = 'repeat_booking';
+        }
+
         if (intent === 'help') {
           try {
             const dynamicHelp = await generateHelpReply({
@@ -976,7 +1017,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
               services: idleServices,
               customerName: savedName || null,
             });
-            reply = dynamicHelp || formatWelcome(businessName, idleServices, savedName, businessType);
+            reply = dynamicHelp ? formatShortWhatsAppReply(dynamicHelp) : formatWelcome(businessName, idleServices, savedName, businessType);
           } catch (err) {
             console.error('[Webhook] generateHelpReply (intent=help) failed:', err.message);
             reply = formatWelcome(businessName, idleServices, savedName, businessType);
@@ -1010,6 +1051,52 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
             ).join('\n');
             reply = `Which appointment would you like to reschedule?\n\n${list}\n\nReply with the number.`;
             await updateSession(phone, businessId, STATES.AWAITING_RESCHEDULE_WHICH, { appointments });
+          }
+          break;
+        }
+
+        if (intent === 'repeat_booking') {
+          const last = await getMostRecentAppointment(phone, businessId);
+          if (!last?.service_id || !last?.staff_id) {
+            reply = `Sure — what would you like to book?\n\nJust tell me the service and the date.`;
+            break;
+          }
+
+          // If service/staff was deleted or deactivated, fall back to normal booking flow.
+          if (last.service_active === false || last.staff_active === false) {
+            const services = idleServices.length ? idleServices : await getServices(businessId);
+            reply = `Sure — what would you like to book?\n\n` + (services.length ? formatServiceList(services, businessType) : `Just tell me the service and date.`);
+            break;
+          }
+
+          const prefilled = {
+            serviceId: last.service_id,
+            serviceName: last.service_name,
+            durationMinutes: last.service_duration_minutes || last.duration_minutes || 30,
+            price: last.service_price ?? null,
+            staffId: last.staff_id,
+            staffName: last.staff_name,
+            lockStaff: true,
+            date: null,
+            time: null,
+            displaySlots: null,
+          };
+
+          // If they already included a date/time in the same message, proceed immediately.
+          const ri = await extractBookingIntent(message, [], businessTZ);
+          if (ri?.date) {
+            await updateSession(phone, businessId, STATES.AWAITING_DATE, {
+              ...prefilled,
+              time: ri.time || null, // optional preference; may auto-skip slot picker if available
+            });
+            nextState = STATES.AWAITING_DATE;
+            lastStepDescriptionForNudge = `Continuing a repeat booking by asking for a date.`;
+            reply = `Got it — *${prefilled.serviceName}* with *${prefilled.staffName}* again.\n\nWhat date works for you?`;
+          } else {
+            await updateSession(phone, businessId, STATES.AWAITING_DATE, prefilled);
+            nextState = STATES.AWAITING_DATE;
+            lastStepDescriptionForNudge = `Asking which date works for their repeat booking.`;
+            reply = `Got it — *${prefilled.serviceName}* with *${prefilled.staffName}* again.\n\nWhat date works for you?`;
           }
           break;
         }
@@ -1290,12 +1377,34 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
             const apptRef       = upcomingAppts[0];
 
             const reminderBody = apptRef
-              ? `⏰ *Reminder!*\n\nYou have an upcoming appointment:\n\nService: ${apptRef.service_name || 'Appointment'}\nDate: ${formatDateTime(apptRef.scheduled_at, businessTZ)}\n\nReply *CANCEL* or *RESCHEDULE* if needed. See you soon! 😊`
+              ? null
               : `⏰ *Reminder!*\n\nThis is your custom reminder from appointbot. 😊`;
 
             setTimeout(async () => {
               try {
-                await sendWhatsAppText(phone, reminderBody, businessId);
+                if (apptRef) {
+                  const templateName = business?.whatsapp_reminder_template || GLOBAL_REMINDER_TEMPLATE;
+                  if (!templateName) throw new Error('No reminder template configured');
+                  const d = new Date(apptRef.scheduled_at);
+                  const apptDate = d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', timeZone: businessTZ });
+                  const apptTime = d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: businessTZ });
+                  await sendWhatsAppTemplate(
+                    phone,
+                    templateName,
+                    [
+                      savedName || apptRef.customer_name || 'there',
+                      apptRef.service_name || 'Appointment',
+                      apptDate,
+                      apptTime,
+                      businessName || 'us',
+                    ],
+                    businessId,
+                    GLOBAL_REMINDER_TEMPLATE_LANG,
+                  );
+                } else {
+                  // Fallback: no appointment reference; this is inside an active chat anyway.
+                  await sendWhatsAppText(phone, reminderBody, businessId);
+                }
                 console.log(`[Reminder] Custom reminder sent to ${phone} (biz ${businessId}) at ${new Date().toISOString()}`);
               } catch (err) {
                 console.error(`[Reminder] Custom reminder failed for ${phone} (biz ${businessId}):`, err.message);
@@ -1326,6 +1435,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
             type:     business?.type,
             services: idleServices.map(s => s.name).join(', '),
           });
+          reply = formatShortWhatsAppReply(reply);
         } catch (convErr) {
           console.error('[Webhook] answerConversational failed:', convErr.message);
           reply = formatNotUnderstood();
@@ -1360,7 +1470,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
           businessName: businessRec?.name || 'us',
           businessType: businessRec?.type || null,
         });
-        reply = dynamic || formatFriendlyFallback("I hit a small hiccup on my end.");
+        reply = dynamic ? formatShortWhatsAppReply(dynamic) : formatFriendlyFallback("I hit a small hiccup on my end.");
       } catch (fallbackErr) {
         console.error('[Webhook] Dynamic fallback failed:', fallbackErr.message);
         reply = formatFriendlyFallback("I hit a small hiccup on my end.");
@@ -1377,7 +1487,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
         businessName: businessRec?.name || 'us',
         businessType: businessRec?.type || null,
       });
-      reply = dynamic || formatNotUnderstood();
+      reply = dynamic ? formatShortWhatsAppReply(dynamic) : formatNotUnderstood();
     } catch {
       reply = formatNotUnderstood();
     }
@@ -1481,7 +1591,7 @@ router.post('/', async (req, res) => {
             businessName: businessRec?.name || 'us',
             businessType: businessRec?.type || null,
           });
-          reply = dynamic || formatFriendlyFallback("I hit a small hiccup on my end.");
+          reply = dynamic ? formatShortWhatsAppReply(dynamic) : formatFriendlyFallback("I hit a small hiccup on my end.");
         } catch (fallbackErr) {
           console.error('[Webhook] Dynamic fallback failed:', fallbackErr.message);
           reply = formatFriendlyFallback("I hit a small hiccup on my end.");
@@ -1549,7 +1659,7 @@ router.post('/', async (req, res) => {
         businessName: businessRec?.name || 'us',
         businessType: businessRec?.type || null,
       });
-      reply = dynamic || formatFriendlyFallback("I hit a small hiccup on my end.");
+      reply = dynamic ? formatShortWhatsAppReply(dynamic) : formatFriendlyFallback("I hit a small hiccup on my end.");
     } catch (fallbackErr) {
       reply = formatFriendlyFallback("I hit a small hiccup on my end.");
     }

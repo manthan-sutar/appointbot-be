@@ -77,7 +77,7 @@ async function sendWithRetry(url, payload, headers, businessId, maxRetries = 1) 
     if (code === 131026 || code === 131047) {
       console.error(
         `[WhatsApp] 24-hour window closed (biz ${businessId}) — freeform text rejected. Code: ${code}.`,
-        '\n  → Fix: Configure a WhatsApp utility message template and set WHATSAPP_REMINDER_TEMPLATE_NAME in .env',
+        '\n  → Fix: Configure a WhatsApp utility message template and set WHATSAPP_REMINDER_TEMPLATE in .env',
         '\n         or set whatsapp_reminder_template on the business record.',
         '\n         See: https://business.whatsapp.com/products/platform-pricing',
       );
