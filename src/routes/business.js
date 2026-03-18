@@ -5,6 +5,7 @@ import { limitStaff, limitServices, PLAN_LIMITS } from '../middleware/planLimits
 import {
   cancelAppointmentById,
   completeAppointmentById,
+  createAppointmentManually,
   getAvailableSlots,
   getBusiness,
   getTodaysAppointments,
@@ -282,20 +283,24 @@ router.get('/appointments', async (req, res) => {
       limit = 25,
     } = req.query;
 
-    const params = [bId];
+    const business = await getBusiness(bId);
+    const tz = business?.timezone || 'Asia/Kolkata';
+
+    // Params: $1 = businessId, $2 = business timezone (used for "today" and "range" filtering)
+    const params = [bId, tz];
     const conditions = ['a.business_id = $1'];
 
     // View presets
     if (view === 'today') {
-      conditions.push(`DATE(a.scheduled_at AT TIME ZONE 'Asia/Kolkata') = CURRENT_DATE`);
+      conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) = CURRENT_DATE`);
     } else if (view === 'upcoming') {
       conditions.push(`a.scheduled_at >= NOW()`);
     } else if (view === 'range' && from) {
       params.push(from);
-      conditions.push(`DATE(a.scheduled_at AT TIME ZONE 'Asia/Kolkata') >= $${params.length}`);
+      conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) >= $${params.length}`);
       if (to) {
         params.push(to);
-        conditions.push(`DATE(a.scheduled_at AT TIME ZONE 'Asia/Kolkata') <= $${params.length}`);
+        conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) <= $${params.length}`);
       }
     }
     // view === 'all' → no date filter
@@ -358,6 +363,54 @@ router.get('/appointments', async (req, res) => {
   } catch (err) {
     console.error('[Appointments] Error:', err);
     res.status(500).json({ error: 'Failed to load appointments' });
+  }
+});
+
+// ─── POST /api/business/appointments/manual ─────────────────────────────
+// Manual admin booking (e.g. customer calls in).
+// Body: { staffId, serviceId, customerPhone, customerName?, date: 'YYYY-MM-DD', time: 'HH:MM', notes? }
+router.post('/appointments/manual', async (req, res) => {
+  const {
+    staffId,
+    serviceId,
+    customerPhone,
+    customerName,
+    date,
+    time,
+    notes,
+  } = req.body || {};
+
+  const apptStaffId = parseInt(staffId, 10);
+  const apptServiceId = parseInt(serviceId, 10);
+
+  if (!apptStaffId || Number.isNaN(apptStaffId)) return res.status(400).json({ error: 'Invalid staffId' });
+  if (!apptServiceId || Number.isNaN(apptServiceId)) return res.status(400).json({ error: 'Invalid serviceId' });
+  if (!customerPhone || !date || !time) {
+    return res.status(400).json({ error: 'customerPhone, date, and time are required' });
+  }
+
+  try {
+    const result = await createAppointmentManually({
+      businessId: req.owner.businessId,
+      staffId: apptStaffId,
+      serviceId: apptServiceId,
+      customerPhone,
+      customerName: customerName || null,
+      date,
+      time,
+      notes: notes || null,
+    });
+
+    if (result?.error) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    return res.status(201).json({ appointment: result });
+  } catch (err) {
+    if (err?.message === 'SLOT_TAKEN') {
+      return res.status(409).json({ error: 'That slot is not available', slots: err.slots || [] });
+    }
+    return res.status(err?.statusCode || 500).json({ error: err?.message || 'Failed to create appointment' });
   }
 });
 

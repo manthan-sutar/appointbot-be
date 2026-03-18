@@ -306,6 +306,81 @@ export async function bookAppointment({
   return rows[0];
 }
 
+// ─── Manual/admin booking (customer called) ────────────────────────────────
+// Creates a confirmed appointment while validating against staff availability.
+export async function createAppointmentManually({
+  businessId,
+  staffId,
+  serviceId,
+  customerPhone,
+  customerName,
+  date,
+  time,
+  notes,
+}) {
+  const normalizedPhone = String(customerPhone || '')
+    .replace(/^whatsapp:/i, '')
+    .replace(/^\+/, '')
+    .replace(/\s+/g, '')
+    .trim();
+
+  const trimmedCustomerName = typeof customerName === 'string' ? customerName.trim() : '';
+
+  if (!normalizedPhone) {
+    const err = new Error('customerPhone is required');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!staffId || !serviceId) {
+    const err = new Error('staffId and serviceId are required');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!date || !time) {
+    const err = new Error('date and time are required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Validate active staff + service and fetch duration from service.
+  const { rows: serviceRows } = await query(
+    `SELECT id, duration_minutes
+     FROM services
+     WHERE id = $1 AND business_id = $2 AND active = TRUE`,
+    [serviceId, businessId],
+  );
+  if (!serviceRows.length) return { error: 'Service not found' };
+
+  const { rows: staffRows } = await query(
+    `SELECT id
+     FROM staff
+     WHERE id = $1 AND business_id = $2 AND active = TRUE`,
+    [staffId, businessId],
+  );
+  if (!staffRows.length) return { error: 'Staff not found' };
+
+  const durationMinutes = serviceRows[0].duration_minutes || 30;
+
+  // Persist customer name for future "my bookings" flows (optional).
+  if (trimmedCustomerName) {
+    await upsertCustomer(normalizedPhone, businessId, trimmedCustomerName);
+  }
+
+  // Reuse the same booking logic used by the WhatsApp chat flow.
+  // This provides SLOT_TAKEN errors + idempotency checks.
+  return bookAppointment({
+    businessId,
+    staffId,
+    serviceId,
+    customerPhone: normalizedPhone,
+    customerName: trimmedCustomerName || null,
+    date,
+    time,
+    durationMinutes,
+    notes: notes || null,
+  });
+}
+
 // ─── Get upcoming appointments for a customer ─────────────────────────────────
 export async function getUpcomingAppointments(customerPhone, businessId) {
   const { rows } = await query(
