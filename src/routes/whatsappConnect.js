@@ -115,8 +115,7 @@ router.get("/start", requireAuth, (req, res) => {
     client_id: appId,
     redirect_uri: redirectUri,
     state,
-    scope:
-      "whatsapp_business_messaging,whatsapp_business_management,business_management",
+    scope: "whatsapp_business_messaging,whatsapp_business_management",
     response_type: "code",
     config_id: configId,
   });
@@ -227,13 +226,12 @@ router.get("/callback", async (req, res) => {
         const tokenData = await tokenRes.json();
 
         if (!tokenRes.ok || !tokenData.access_token) {
-          console.error(
-            "[WhatsApp Connect] Token exchange failed:",
-            tokenData,
-          );
+          console.error("[WhatsApp Connect] Token exchange failed:", tokenData);
         } else {
           const userAccessToken = tokenData.access_token;
-          console.log("[WhatsApp Connect] Token exchange succeeded, resolving WABA + phone numbers…");
+          console.log(
+            "[WhatsApp Connect] Token exchange succeeded, resolving WABA + phone numbers…",
+          );
 
           let resolvedWabaId = null;
           let firstPhone = null;
@@ -244,7 +242,10 @@ router.get("/callback", async (req, res) => {
               `https://graph.facebook.com/${apiVersion}/me?fields=businesses{owned_whatsapp_business_accounts}&access_token=${encodeURIComponent(userAccessToken)}`,
             );
             const me = await meRes.json();
-            console.log("[WhatsApp Connect] /me response:", JSON.stringify(me).slice(0, 500));
+            console.log(
+              "[WhatsApp Connect] /me response:",
+              JSON.stringify(me).slice(0, 500),
+            );
 
             const meBiz = me.businesses?.data || [];
             for (const b of meBiz) {
@@ -255,7 +256,10 @@ router.get("/callback", async (req, res) => {
               }
             }
           } catch (e) {
-            console.error("[WhatsApp Connect] Strategy 1 (/me) failed:", e.message);
+            console.error(
+              "[WhatsApp Connect] Strategy 1 (/me) failed:",
+              e.message,
+            );
           }
 
           // Strategy 2: use debug_token to find granular_scopes with WhatsApp targets
@@ -265,28 +269,43 @@ router.get("/callback", async (req, res) => {
                 `https://graph.facebook.com/${apiVersion}/debug_token?input_token=${encodeURIComponent(userAccessToken)}&access_token=${encodeURIComponent(appId + "|" + appSecret)}`,
               );
               const debugData = await debugRes.json();
-              console.log("[WhatsApp Connect] debug_token response:", JSON.stringify(debugData).slice(0, 800));
+              console.log(
+                "[WhatsApp Connect] debug_token response:",
+                JSON.stringify(debugData).slice(0, 800),
+              );
 
               const scopes = debugData.data?.granular_scopes || [];
               for (const scope of scopes) {
-                if (scope.scope === "whatsapp_business_management" && scope.target_ids?.length) {
+                if (
+                  scope.scope === "whatsapp_business_management" &&
+                  scope.target_ids?.length
+                ) {
                   resolvedWabaId = scope.target_ids[0];
                   break;
                 }
-                if (scope.scope === "whatsapp_business_messaging" && scope.target_ids?.length) {
+                if (
+                  scope.scope === "whatsapp_business_messaging" &&
+                  scope.target_ids?.length
+                ) {
                   resolvedWabaId = scope.target_ids[0];
                   break;
                 }
               }
             } catch (e) {
-              console.error("[WhatsApp Connect] Strategy 2 (debug_token) failed:", e.message);
+              console.error(
+                "[WhatsApp Connect] Strategy 2 (debug_token) failed:",
+                e.message,
+              );
             }
           }
 
           // Strategy 3: fall back to env WHATSAPP_BUSINESS_ACCOUNT_ID if set
           if (!resolvedWabaId && process.env.WHATSAPP_BUSINESS_ACCOUNT_ID) {
             resolvedWabaId = process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
-            console.log("[WhatsApp Connect] Strategy 3: using env WHATSAPP_BUSINESS_ACCOUNT_ID:", resolvedWabaId);
+            console.log(
+              "[WhatsApp Connect] Strategy 3: using env WHATSAPP_BUSINESS_ACCOUNT_ID:",
+              resolvedWabaId,
+            );
           }
 
           // Fetch phone numbers from the resolved WABA
@@ -296,10 +315,16 @@ router.get("/callback", async (req, res) => {
                 `https://graph.facebook.com/${apiVersion}/${resolvedWabaId}/phone_numbers?access_token=${encodeURIComponent(userAccessToken)}`,
               );
               const phonesData = await phonesRes.json();
-              console.log("[WhatsApp Connect] phone_numbers response:", JSON.stringify(phonesData).slice(0, 500));
+              console.log(
+                "[WhatsApp Connect] phone_numbers response:",
+                JSON.stringify(phonesData).slice(0, 500),
+              );
               firstPhone = phonesData.data?.[0] || null;
             } catch (e) {
-              console.error("[WhatsApp Connect] Failed to fetch phone numbers:", e.message);
+              console.error(
+                "[WhatsApp Connect] Failed to fetch phone numbers:",
+                e.message,
+              );
             }
           }
 
@@ -335,10 +360,18 @@ router.get("/callback", async (req, res) => {
 
               return res.send(successHtml(decoded.frontendOrigin));
             } catch (saveErr) {
-              console.error("[WhatsApp Connect] Failed to save config (code path):", saveErr.message);
+              console.error(
+                "[WhatsApp Connect] Failed to save config (code path):",
+                saveErr.message,
+              );
             }
           } else {
-            console.error("[WhatsApp Connect] Could not resolve phone number. WABA:", resolvedWabaId, "Phone:", firstPhone);
+            console.error(
+              "[WhatsApp Connect] Could not resolve phone number. WABA:",
+              resolvedWabaId,
+              "Phone:",
+              firstPhone,
+            );
           }
         }
       } catch (ex) {
