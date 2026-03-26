@@ -143,6 +143,32 @@ function looksLikeGibberish(msg) {
   return false;
 }
 
+// Relative reminder parser for phrases like:
+// "in 5 minutes", "after 2 hours", "10 mins later", "1 hr from now".
+function extractRelativeReminderDelayMs(message) {
+  const text = (message || '').toLowerCase();
+  if (!text) return null;
+
+  const patterns = [
+    /\b(?:in|after)\s+(\d{1,3})\s*(minutes?|mins?|min|hours?|hrs?|hr)\b/i,
+    /\b(\d{1,3})\s*(minutes?|mins?|min|hours?|hrs?|hr)\s*(?:later|from\s+now)\b/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+
+    const rawValue = parseInt(match[1], 10);
+    if (!Number.isFinite(rawValue) || rawValue <= 0) return null;
+
+    const unit = (match[2] || '').toLowerCase();
+    const minutes = unit.startsWith('h') ? rawValue * 60 : rawValue;
+    return minutes * 60 * 1000;
+  }
+
+  return null;
+}
+
 // ─── Meta WhatsApp Cloud API verification ────────────────────────────────────
 router.get('/', (req, res) => {
   const mode      = req.query['hub.mode'];
@@ -1348,20 +1374,38 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
 
         if (intent === 'reminder') {
           try {
-            // Parse the time (and optional date) from the message
-            const ri = await extractBookingIntent(message, [], businessTZ);
+            // Prefer deterministic relative parsing first:
+            // "after 5 minutes", "in 2 hours", etc.
+            const relativeDelayMs = extractRelativeReminderDelayMs(message);
+            let delayMs = relativeDelayMs;
+            let confirmationLine = '';
 
-            if (!ri.time) {
-              reply = `I automatically send you a reminder 24 hours before every appointment — no need to ask! 😊\n\nIf you'd like a reminder at a specific time, just tell me the time (e.g. "remind me at 7pm today").`;
-              break;
+            if (delayMs == null) {
+              // Fallback to absolute time extraction ("at 7pm today").
+              const ri = await extractBookingIntent(message, [], businessTZ);
+              if (!ri.time) {
+                reply = `I automatically send you a reminder 24 hours before every appointment — no need to ask! 😊\n\nIf you'd like a reminder at a specific time, just tell me the time (e.g. "remind me at 7pm today").`;
+                break;
+              }
+
+              const todayStr   = new Date().toLocaleDateString('en-CA', { timeZone: businessTZ });
+              const targetDate = ri.date || todayStr;
+
+              // Convert the reminder time (expressed in business timezone) to a true UTC Date
+              const reminderAt = localToUTC(targetDate, ri.time, businessTZ);
+              delayMs = reminderAt.getTime() - Date.now();
+              confirmationLine = `I'll remind you at *${formatTime(ri.time)}* today.`;
+            } else {
+              const reminderAt = new Date(Date.now() + delayMs);
+              const atTime = reminderAt.toLocaleTimeString('en-IN', {
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: true,
+                timeZone: businessTZ,
+              });
+              const mins = Math.round(delayMs / 60000);
+              confirmationLine = `I'll remind you in *${mins} minute${mins === 1 ? '' : 's'}* (around *${atTime}*).`;
             }
-
-            const todayStr   = new Date().toLocaleDateString('en-CA', { timeZone: businessTZ });
-            const targetDate = ri.date || todayStr;
-
-            // Convert the reminder time (expressed in business timezone) to a true UTC Date
-            const reminderAt = localToUTC(targetDate, ri.time, businessTZ);
-            const delayMs    = reminderAt.getTime() - Date.now();
 
             if (delayMs <= 0) {
               reply = `That time has already passed! 😅\n\nWould you like me to remind you at a different time today?`;
@@ -1411,7 +1455,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
               }
             }, delayMs);
 
-            reply = `✅ Got it! I'll remind you at *${formatTime(ri.time)}* today.\n\nYour automatic 24-hour reminder before the appointment is still set too. 😊`;
+            reply = `✅ Got it! ${confirmationLine}\n\nYour automatic 24-hour reminder before the appointment is still set too. 😊`;
           } catch (reminderErr) {
             console.error('[Webhook] Reminder intent failed:', reminderErr.message);
             // Never send "hiccup" for reminder — confirm they're covered by automatic reminders
