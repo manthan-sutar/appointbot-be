@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { deleteSession } from '../services/session.service.js';
 import { getBusinessBySlug, getBusiness } from '../services/appointment.service.js';
 import { upsertLeadActivity, trackLeadEvent } from '../services/lead.service.js';
+import { validateWidgetApiKey } from '../middleware/widgetAuth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -20,20 +21,23 @@ async function resolveBusiness(slug) {
 }
 
 // ─── GET /chat/:slug/widget.js — embeddable website chat bubble ──────────────
-router.get('/:slug/widget.js', async (req, res) => {
-  const biz = await resolveBusiness(req.params.slug);
-  if (!biz) return res.status(404).type('application/javascript').send('// Business not found');
+// Protected by API key authentication
+router.get('/:slug/widget.js', validateWidgetApiKey, async (req, res) => {
+  // Business is already validated and attached by middleware
+  const biz = req.business;
 
   // Use BACKEND_URL env var or construct from request
   const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+  const apiKey = req.query.api_key || req.query.apiKey;
 
   const script = `(function () {
     if (window.__appointbotWidgetLoaded) return;
     window.__appointbotWidgetLoaded = true;
     var slug = ${JSON.stringify(biz.slug || req.params.slug)};
     var backendUrl = ${JSON.stringify(backendUrl)};
+    var apiKey = ${JSON.stringify(apiKey)};
     var iframe = document.createElement('iframe');
-    iframe.src = backendUrl + '/chat/' + encodeURIComponent(slug) + '?embed=1&source=website_chat_widget';
+    iframe.src = backendUrl + '/chat/' + encodeURIComponent(slug) + '?embed=1&source=website_chat_widget&api_key=' + encodeURIComponent(apiKey);
     iframe.style.position = 'fixed';
     iframe.style.right = '20px';
     iframe.style.bottom = '20px';

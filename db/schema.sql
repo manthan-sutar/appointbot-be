@@ -153,6 +153,10 @@ ALTER TABLE businesses
   ADD COLUMN IF NOT EXISTS auto_cancel_unconfirmed_enabled BOOLEAN NOT NULL DEFAULT TRUE,
   ADD COLUMN IF NOT EXISTS confirmation_cutoff_minutes INTEGER NOT NULL DEFAULT 90;
 
+-- Widget API key for secure embedding
+ALTER TABLE businesses
+  ADD COLUMN IF NOT EXISTS widget_api_key TEXT UNIQUE;
+
 -- ─── Appointment confirmation lifecycle (no-show prevention) ──────────────────
 -- Kept as ALTER statements for backward-compatible rollout on existing DBs.
 ALTER TABLE appointments

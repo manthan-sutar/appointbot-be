@@ -74,6 +74,15 @@ export async function getBusinessBySlug(slug) {
   return rows[0] || null;
 }
 
+// ─── Get business by widget API key ───────────────────────────────────────────
+export async function getBusinessByWidgetApiKey(apiKey) {
+  const { rows } = await query(
+    `SELECT * FROM businesses WHERE widget_api_key = $1`,
+    [apiKey]
+  );
+  return rows[0] || null;
+}
+
 // ─── Get business by phone (for WhatsApp webhook routing) ─────────────────────
 // When multiple businesses use the same number (e.g. shared test number), returns
 // the latest one by creation time so the most recently registered business wins.

@@ -28,6 +28,7 @@ import {
   updateTemplate,
 } from '../services/campaign-template.service.js';
 import { curateSlots } from '../utils/formatter.js';
+import { generateApiKey } from '../utils/apiKey.js';
 
 const router = express.Router();
 router.use(requireAuth);
@@ -1440,6 +1441,62 @@ router.get('/whatsapp', async (req, res) => {
   } catch (err) {
     console.error('[Business] Load WhatsApp config error:', err.message);
     return res.status(500).json({ error: 'Failed to load WhatsApp settings' });
+  }
+});
+
+// ─── GET /api/business/widget-api-key ─────────────────────────────────────────
+// Returns the widget API key for embedding chat on external websites
+router.get('/widget-api-key', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT widget_api_key, slug FROM businesses WHERE id = $1`,
+      [req.owner.businessId]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Business not found' });
+
+    const apiKey = rows[0].widget_api_key;
+    const slug = rows[0].slug;
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
+
+    return res.json({
+      apiKey,
+      widgetUrl: apiKey ? `${backendUrl}/chat/${slug}/widget.js?api_key=${apiKey}` : null,
+      embedCode: apiKey ? `<script async src="${backendUrl}/chat/${slug}/widget.js?api_key=${apiKey}"></script>` : null,
+    });
+  } catch (err) {
+    console.error('[Business] Load widget API key error:', err.message);
+    return res.status(500).json({ error: 'Failed to load widget API key' });
+  }
+});
+
+// ─── POST /api/business/widget-api-key/regenerate ─────────────────────────────
+// Generates a new widget API key (or creates one if none exists)
+router.post('/widget-api-key/regenerate', async (req, res) => {
+  try {
+    const newApiKey = generateApiKey();
+
+    const { rows } = await query(
+      `UPDATE businesses
+       SET widget_api_key = $1
+       WHERE id = $2
+       RETURNING widget_api_key, slug`,
+      [newApiKey, req.owner.businessId]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Business not found' });
+
+    const slug = rows[0].slug;
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
+
+    return res.json({
+      apiKey: newApiKey,
+      widgetUrl: `${backendUrl}/chat/${slug}/widget.js?api_key=${newApiKey}`,
+      embedCode: `<script async src="${backendUrl}/chat/${slug}/widget.js?api_key=${newApiKey}"></script>`,
+    });
+  } catch (err) {
+    console.error('[Business] Regenerate widget API key error:', err.message);
+    return res.status(500).json({ error: 'Failed to regenerate widget API key' });
   }
 });
 
