@@ -84,6 +84,19 @@ async function sendWithRetry(url, payload, headers, businessId, maxRetries = 1) 
       throw new Error(`WhatsApp window closed (131026): ${errMsg}`);
     }
 
+    // Dev / test number list — Meta only allows a small whitelist until app is Live + WABA verified.
+    // Code 131030 = "Recipient phone number not in allowed list"
+    if (code === 131030) {
+      console.error(
+        `[WhatsApp] Recipient not on Meta allowlist (biz ${businessId}). Code: 131030. ${errMsg}`,
+        '\n  → Development: Meta Developer → Your App → WhatsApp → API Setup — add each recipient phone, verify OTP (limited test numbers).',
+        '\n  → Production: Publish the app (Live), complete Business Verification in Meta Business Manager,',
+        '\n     use approved Marketing/Utility templates for outbound bulk; recipients must use WhatsApp and opt-in.',
+        '\n  → See: appointbot-be/docs/WHATSAPP_CAMPAIGNS.md',
+      );
+      throw new Error(`WhatsApp send failed: ${errMsg}`);
+    }
+
     // Rate limit — do not retry
     if (res.status === 429) {
       console.error(`[WhatsApp] Rate limited (biz ${businessId}). ${errMsg}`);

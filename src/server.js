@@ -4,7 +4,9 @@ import cors from "cors";
 
 import webhookRouter from "./routes/webhook.js";
 import chatRouter from "./routes/chat.js";
+import widgetPublicRouter, { serveWidgetScript } from "./routes/widget-public.js";
 import adminRouter from "./routes/admin.js";
+import { validateWidgetApiKey } from "./middleware/widgetAuth.js";
 import billingRouter from "./routes/billing.js";
 import authRouter from "./routes/auth.js";
 import businessRouter from "./routes/business.js";
@@ -15,11 +17,36 @@ import { startReminderScheduler } from "./services/reminder.service.js";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// So req.protocol / X-Forwarded-* match the public URL behind Render, Railway, etc.
+app.set("trust proxy", 1);
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+// Include this server's own origin — same-origin fetch from /chat/* still sends Origin
+// (e.g. http://localhost:3000) and must be allowed or cors() rejects with an error → 500.
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  process.env.BACKEND_URL,
+  "http://localhost:5173",
+  "http://localhost:5175",
+  `http://localhost:${PORT}`,
+  `http://127.0.0.1:${PORT}`,
+].filter(Boolean);
+
+const strictCors = cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(null, false);
+  },
   credentials: true,
-}));
+});
+
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/widget")) {
+    return cors({ origin: true, credentials: false })(req, res, next);
+  }
+  return strictCors(req, res, next);
+});
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
@@ -30,6 +57,8 @@ app.get("/health", (req, res) =>
 
 app.use("/api/auth", authRouter);
 app.use("/api/business", businessRouter);
+app.use("/api/widget", widgetPublicRouter);
+app.get("/widget.js", validateWidgetApiKey, serveWidgetScript);
 app.use("/api/billing", billingRouter);
 app.use("/api/whatsapp-connect", whatsappConnectRouter);
 // Razorpay webhooks — support both /webhooks/razorpay and /webhook/razorpay

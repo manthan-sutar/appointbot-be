@@ -311,8 +311,9 @@ export async function bookAppointment({
      VALUES (
        $1, $2, $3, $4, $5, $6, $7, 'confirmed', $8, 'pending',
        GREATEST(
-         $6 - make_interval(mins => COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = $1), 90)),
-         NOW()
+         ($6::timestamptz
+           - (COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = $1), 90) * INTERVAL '1 minute')),
+         NOW()::timestamptz
        )
      )
      RETURNING *`,
@@ -537,8 +538,9 @@ export async function rescheduleAppointment(
          reminder_2h_sent = FALSE,
          confirmation_status = 'pending',
          confirmation_deadline_at = GREATEST(
-           $1 - make_interval(mins => COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = appointments.business_id), 90)),
-           NOW()
+           ($1::timestamptz
+             - (COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = appointments.business_id), 90) * INTERVAL '1 minute')),
+           NOW()::timestamptz
          ),
          auto_cancelled_at = NULL,
          cancel_reason = NULL
@@ -588,8 +590,9 @@ export async function rescheduleAppointmentById(appointmentId, businessId, newDa
          reminder_2h_sent = FALSE,
          confirmation_status = 'pending',
          confirmation_deadline_at = GREATEST(
-           $1 - make_interval(mins => COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = $3), 90)),
-           NOW()
+           ($1::timestamptz
+             - (COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = $3), 90) * INTERVAL '1 minute')),
+           NOW()::timestamptz
          ),
          auto_cancelled_at = NULL,
          cancel_reason = NULL

@@ -6,6 +6,22 @@ export const PLAN_LIMITS = {
   business: { staff: Infinity,  services: Infinity,  bookingsPerMonth: Infinity },
 };
 
+/** Exported for GET /api/business/plan and limit checks — same rules. */
+export function effectivePlanFromSubscriptionRow(row) {
+  if (!row) return 'free';
+  // Active trial → treat as pro plan for limits / UI
+  if (
+    row.status === 'trialing' &&
+    row.trial_ends_at &&
+    new Date(row.trial_ends_at) > new Date()
+  ) {
+    return 'pro';
+  }
+  const p = String(row.plan || 'free').toLowerCase();
+  if (p === 'business' || p === 'pro' || p === 'free') return p;
+  return 'free';
+}
+
 async function getEffectivePlan(businessId) {
   const { rows } = await query(
     `SELECT plan, status, trial_ends_at
@@ -13,14 +29,7 @@ async function getEffectivePlan(businessId) {
       WHERE business_id = $1`,
     [businessId]
   );
-  if (!rows.length) return 'free';
-  const sub = rows[0];
-
-  // Active trial → treat as pro plan for limits
-  if (sub.status === 'trialing' && sub.trial_ends_at && new Date(sub.trial_ends_at) > new Date()) {
-    return 'pro';
-  }
-  return sub.plan || 'free';
+  return effectivePlanFromSubscriptionRow(rows[0]);
 }
 
 async function countRows(table, businessId) {

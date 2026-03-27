@@ -11,30 +11,61 @@ export async function validateWidgetApiKey(req, res, next) {
 
     if (!apiKey) {
       return res.status(401).type('application/javascript').send(
-        '// Error: API key is required. Get your API key from the appointbot dashboard.'
+        '// Error: API key is required. Get your API key from the appointbot dashboard.',
       );
     }
 
     if (!isValidApiKeyFormat(apiKey)) {
       return res.status(401).type('application/javascript').send(
-        '// Error: Invalid API key format.'
+        '// Error: Invalid API key format.',
       );
     }
 
     const business = await getBusinessByWidgetApiKey(apiKey);
     if (!business) {
       return res.status(401).type('application/javascript').send(
-        '// Error: Invalid API key.'
+        '// Error: Invalid API key.',
       );
     }
 
-    // Attach business to request for use in route handler
     req.business = business;
     next();
   } catch (err) {
     console.error('[Widget Auth] Error:', err);
     res.status(500).type('application/javascript').send(
-      '// Error: Server error validating API key.'
+      '// Error: Server error validating API key.',
     );
+  }
+}
+
+/**
+ * Same as validateWidgetApiKey but for JSON API (POST /api/widget/*).
+ * Key from X-Widget-Api-Key or Authorization: Bearer
+ */
+export async function validateWidgetApiKeyHeader(req, res, next) {
+  try {
+    const raw =
+      req.headers['x-widget-api-key'] ||
+      req.headers['X-Widget-Api-Key'] ||
+      (req.headers.authorization && String(req.headers.authorization).replace(/^Bearer\s+/i, ''));
+
+    if (!raw) {
+      return res.status(401).json({ error: 'Missing X-Widget-Api-Key header' });
+    }
+
+    if (!isValidApiKeyFormat(raw)) {
+      return res.status(401).json({ error: 'Invalid API key format' });
+    }
+
+    const business = await getBusinessByWidgetApiKey(raw);
+    if (!business) {
+      return res.status(401).json({ error: 'Invalid API key' });
+    }
+
+    req.business = business;
+    next();
+  } catch (err) {
+    console.error('[Widget Auth] Header error:', err);
+    res.status(500).json({ error: 'Server error validating API key' });
   }
 }

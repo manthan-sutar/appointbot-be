@@ -1,15 +1,34 @@
 import express from 'express';
+import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { deleteSession } from '../services/session.service.js';
 import { getBusinessBySlug, getBusiness } from '../services/appointment.service.js';
 import { upsertLeadActivity, trackLeadEvent } from '../services/lead.service.js';
 import { validateWidgetApiKey } from '../middleware/widgetAuth.js';
+import { serveWidgetScript } from './widget-public.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 
 const DEFAULT_BUSINESS_ID = parseInt(process.env.DEFAULT_BUSINESS_ID || '1', 10);
+
+/**
+ * Base URL to POST /webhook on this same Node process.
+ * Do NOT use BACKEND_URL here — it often points at production (emails, widget embeds)
+ * while you are running locally; that breaks the chat proxy with timeouts / wrong DB.
+ */
+function webhookBaseUrl(req) {
+  const host = req?.get?.("host");
+  if (host) {
+    const proto = req.protocol || "http";
+    return `${proto}://${host}`.replace(/\/$/, "");
+  }
+  const port = process.env.PORT || 3000;
+  const fallback =
+    process.env.INTERNAL_WEBHOOK_BASE_URL || `http://127.0.0.1:${port}`;
+  return String(fallback).replace(/\/$/, "");
+}
 
 // ─── Helper: resolve business from slug or fallback ───────────────────────────
 async function resolveBusiness(slug) {
@@ -20,64 +39,8 @@ async function resolveBusiness(slug) {
   return getBusiness(DEFAULT_BUSINESS_ID);
 }
 
-// ─── GET /chat/:slug/widget.js — embeddable website chat bubble ──────────────
-// Protected by API key authentication
-router.get('/:slug/widget.js', validateWidgetApiKey, async (req, res) => {
-  // Business is already validated and attached by middleware
-  const biz = req.business;
-
-  // Use BACKEND_URL env var or construct from request
-  const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
-  const apiKey = req.query.api_key || req.query.apiKey;
-
-  const script = `(function () {
-    if (window.__appointbotWidgetLoaded) return;
-    window.__appointbotWidgetLoaded = true;
-    var slug = ${JSON.stringify(biz.slug || req.params.slug)};
-    var backendUrl = ${JSON.stringify(backendUrl)};
-    var apiKey = ${JSON.stringify(apiKey)};
-    var iframe = document.createElement('iframe');
-    iframe.src = backendUrl + '/chat/' + encodeURIComponent(slug) + '?embed=1&source=website_chat_widget&api_key=' + encodeURIComponent(apiKey);
-    iframe.style.position = 'fixed';
-    iframe.style.right = '20px';
-    iframe.style.bottom = '20px';
-    iframe.style.width = '380px';
-    iframe.style.height = '620px';
-    iframe.style.border = '0';
-    iframe.style.borderRadius = '16px';
-    iframe.style.boxShadow = '0 18px 50px rgba(0,0,0,0.25)';
-    iframe.style.zIndex = '2147483000';
-    iframe.style.display = 'none';
-
-    var btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = 'Chat with us';
-    btn.style.position = 'fixed';
-    btn.style.right = '20px';
-    btn.style.bottom = '20px';
-    btn.style.background = '#16a34a';
-    btn.style.color = '#fff';
-    btn.style.border = '0';
-    btn.style.borderRadius = '9999px';
-    btn.style.padding = '12px 16px';
-    btn.style.font = '600 14px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
-    btn.style.boxShadow = '0 10px 24px rgba(0,0,0,0.2)';
-    btn.style.cursor = 'pointer';
-    btn.style.zIndex = '2147483001';
-
-    var open = false;
-    btn.addEventListener('click', function () {
-      open = !open;
-      iframe.style.display = open ? 'block' : 'none';
-      btn.textContent = open ? 'Close chat' : 'Chat with us';
-    });
-
-    document.body.appendChild(iframe);
-    document.body.appendChild(btn);
-  })();`;
-
-  return res.type('application/javascript').send(script);
-});
+// ─── GET /chat/:slug/widget.js — same self-contained bundle as GET /widget.js (legacy path)
+router.get('/:slug/widget.js', validateWidgetApiKey, serveWidgetScript);
 
 // ─── GET /chat — legacy root (redirects to default slug) ─────────────────────
 router.get('/', async (req, res) => {
@@ -90,8 +53,17 @@ router.get('/', async (req, res) => {
 router.get('/:slug', async (req, res) => {
   const biz = await resolveBusiness(req.params.slug);
   if (!biz) return res.status(404).send('Business not found');
-  // Serve chat.html — business info is injected via query params read by the UI
-  res.sendFile(path.join(__dirname, '../../public/chat.html'));
+  const htmlPath = path.join(__dirname, '../../public/chat.html');
+  let html = await fs.readFile(htmlPath, 'utf8');
+  const inject =
+    '<script>window.__APPOINTBOT__=' +
+    JSON.stringify({
+      name: biz.name,
+      slug: biz.slug || req.params.slug,
+    }) +
+    '<\/script>';
+  html = html.replace('</head>', `${inject}</head>`);
+  res.type('html').send(html);
 });
 
 // ─── POST /chat/:slug/send — proxy message to webhook ────────────────────────
@@ -101,7 +73,6 @@ router.post('/:slug/send', async (req, res) => {
 
   const { message, source, campaign, utmSource } = req.body;
   const testPhone = `test-${biz.slug || biz.id}`;
-  const port = process.env.PORT || 3000;
 
   try {
     const lead = await upsertLeadActivity({
@@ -119,7 +90,7 @@ router.post('/:slug/send', async (req, res) => {
       });
     }
 
-    const response = await fetch(`http://localhost:${port}/webhook`, {
+    const response = await fetch(`${webhookBaseUrl(req)}/webhook`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -146,9 +117,8 @@ router.post('/send', async (req, res) => {
   req.params = { slug };
   // Re-use slug handler
   const testPhone = `test-${slug}`;
-  const port = process.env.PORT || 3000;
   try {
-    const response = await fetch(`http://localhost:${port}/webhook`, {
+    const response = await fetch(`${webhookBaseUrl(req)}/webhook`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

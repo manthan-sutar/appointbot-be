@@ -1,7 +1,13 @@
 import express from 'express';
+import { getPublicBackendUrlForWidget } from '../utils/publicBackendUrl.js';
 import { query } from '../config/db.js';
 import { requireAuth, signToken } from '../middleware/auth.js';
-import { limitStaff, limitServices, PLAN_LIMITS } from '../middleware/planLimits.js';
+import {
+  limitStaff,
+  limitServices,
+  PLAN_LIMITS,
+  effectivePlanFromSubscriptionRow,
+} from '../middleware/planLimits.js';
 import {
   cancelAppointmentById,
   completeAppointmentById,
@@ -738,18 +744,21 @@ router.get('/appointments', async (req, res) => {
     }
     const tz = business?.timezone || 'Asia/Kolkata';
 
-    // Params: $1 = businessId, $2 = business timezone (used for "today" and "range" filtering)
-    const params = [bId, tz];
+    // Build params so placeholders stay $1..$N with no gaps — PostgreSQL rejects skipped indices
+    // (e.g. upcoming/all must not reserve $2 for tz if the query never references it).
+    const params = [bId];
     const conditions = ['a.business_id = $1'];
 
     // View presets ("today" = calendar day in business timezone)
     if (view === 'today') {
+      params.push(tz);
       conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) = DATE(NOW() AT TIME ZONE $2)`);
     } else if (view === 'upcoming') {
       conditions.push(`a.scheduled_at >= NOW()`);
     } else if (view === 'range' && from) {
+      params.push(tz);
       params.push(from);
-      conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) >= $${params.length}`);
+      conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) >= $3`);
       if (to) {
         params.push(to);
         conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) <= $${params.length}`);
@@ -1394,7 +1403,7 @@ router.get('/plan', async (req, res) => {
     `SELECT * FROM subscriptions WHERE business_id = $1`,
     [req.owner.businessId]
   );
-  const plan = rows[0]?.plan || 'free';
+  const plan = effectivePlanFromSubscriptionRow(rows[0]);
   res.json({ plan, limits: PLAN_LIMITS[plan], allPlans: PLAN_LIMITS });
 });
 
@@ -1449,20 +1458,19 @@ router.get('/whatsapp', async (req, res) => {
 router.get('/widget-api-key', async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT widget_api_key, slug FROM businesses WHERE id = $1`,
+      `SELECT widget_api_key FROM businesses WHERE id = $1`,
       [req.owner.businessId]
     );
 
     if (!rows.length) return res.status(404).json({ error: 'Business not found' });
 
     const apiKey = rows[0].widget_api_key;
-    const slug = rows[0].slug;
-    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
+    const backendUrl = getPublicBackendUrlForWidget(req);
 
     return res.json({
       apiKey,
-      widgetUrl: apiKey ? `${backendUrl}/chat/${slug}/widget.js?api_key=${apiKey}` : null,
-      embedCode: apiKey ? `<script async src="${backendUrl}/chat/${slug}/widget.js?api_key=${apiKey}"></script>` : null,
+      widgetUrl: apiKey ? `${backendUrl}/widget.js?api_key=${apiKey}` : null,
+      embedCode: apiKey ? `<script async src="${backendUrl}/widget.js?api_key=${apiKey}"></script>` : null,
     });
   } catch (err) {
     console.error('[Business] Load widget API key error:', err.message);
@@ -1480,19 +1488,18 @@ router.post('/widget-api-key/regenerate', async (req, res) => {
       `UPDATE businesses
        SET widget_api_key = $1
        WHERE id = $2
-       RETURNING widget_api_key, slug`,
+       RETURNING widget_api_key`,
       [newApiKey, req.owner.businessId]
     );
 
     if (!rows.length) return res.status(404).json({ error: 'Business not found' });
 
-    const slug = rows[0].slug;
-    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
+    const backendUrl = getPublicBackendUrlForWidget(req);
 
     return res.json({
       apiKey: newApiKey,
-      widgetUrl: `${backendUrl}/chat/${slug}/widget.js?api_key=${newApiKey}`,
-      embedCode: `<script async src="${backendUrl}/chat/${slug}/widget.js?api_key=${newApiKey}"></script>`,
+      widgetUrl: `${backendUrl}/widget.js?api_key=${newApiKey}`,
+      embedCode: `<script async src="${backendUrl}/widget.js?api_key=${newApiKey}"></script>`,
     });
   } catch (err) {
     console.error('[Business] Regenerate widget API key error:', err.message);
