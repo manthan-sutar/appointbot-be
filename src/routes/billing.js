@@ -7,6 +7,7 @@ import {
   cancelRazorpaySubscription,
   fetchRazorpaySubscription,
 } from '../services/razorpay.service.js';
+import { effectivePlanFromSubscriptionRow } from '../middleware/planLimits.js';
 
 const router = express.Router();
 router.use(requireAuth);
@@ -48,12 +49,15 @@ async function getSubscriptionForBusiness(businessId) {
     }
   }
 
+  const effectivePlan = effectivePlanFromSubscriptionRow(sub);
+
   return {
     ...sub,
     current_period_end: currentPeriodEnd,
     trialActive,
     trialDaysLeft,
     cancel_at_period_end: !!sub.cancel_at_period_end,
+    effectivePlan,
   };
 }
 
@@ -63,13 +67,17 @@ router.get('/subscription', async (req, res) => {
     const businessId = req.owner.businessId;
     const sub = await getSubscriptionForBusiness(businessId);
     if (!sub) {
+      // No subscriptions row (legacy DB) — not a trial; avoid misleading "trialing" status in UI.
       return res.json({
         subscription: {
           business_id: businessId,
           plan: 'free',
-          status: 'trialing',
+          effectivePlan: 'free',
+          status: 'none',
+          gateway: 'none',
           trialActive: false,
           trialDaysLeft: 0,
+          trial_ends_at: null,
           cancel_at_period_end: false,
         },
       });

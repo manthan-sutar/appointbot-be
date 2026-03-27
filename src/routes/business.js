@@ -539,6 +539,12 @@ router.post('/onboard', async (req, res) => {
 // ─── GET /api/business ────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
+    if (req.owner.businessId == null) {
+      return res.status(400).json({
+        error: 'No business linked to this account. Complete onboarding first.',
+        business: null,
+      });
+    }
     const { rows } = await query(
       `SELECT b.*, s.plan FROM businesses b
        LEFT JOIN subscriptions s ON b.id = s.business_id
