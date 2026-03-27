@@ -301,3 +301,25 @@ CREATE TABLE IF NOT EXISTS messaging_preferences (
 
 CREATE INDEX IF NOT EXISTS idx_messaging_preferences_business_optout
   ON messaging_preferences(business_id, campaign_opt_out, updated_at DESC);
+
+-- Campaign templates (in-app template drafts linked to Meta-approved template names)
+CREATE TABLE IF NOT EXISTS campaign_templates (
+  id SERIAL PRIMARY KEY,
+  business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT,
+  send_mode TEXT NOT NULL DEFAULT 'text'
+    CHECK (send_mode IN ('text', 'template')),
+  meta_template_name TEXT,
+  template_language TEXT NOT NULL DEFAULT 'en',
+  content_text TEXT,
+  content_media_url TEXT,
+  variable_count INTEGER NOT NULL DEFAULT 0,
+  variable_labels JSONB NOT NULL DEFAULT '[]'::jsonb,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_templates_business
+  ON campaign_templates(business_id, active, created_at DESC);

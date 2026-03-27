@@ -20,6 +20,13 @@ import {
   sendCampaignNow,
 } from '../services/campaign.service.js';
 import { listCampaignOptOutPreferences, setCampaignOptOut } from '../services/messaging-preference.service.js';
+import {
+  createTemplate,
+  deleteTemplate,
+  getTemplate,
+  listTemplates,
+  updateTemplate,
+} from '../services/campaign-template.service.js';
 import { curateSlots } from '../utils/formatter.js';
 
 const router = express.Router();
@@ -1793,6 +1800,90 @@ router.post('/campaigns/:id/retry-failed', async (req, res) => {
   } catch (err) {
     console.error('[Campaigns] Retry failed error:', err.message);
     return res.status(500).json({ error: 'Failed to retry failed recipients' });
+  }
+});
+
+// ─── Campaign Templates ────────────────────────────────────────────────────────
+router.get('/campaign-templates', async (req, res) => {
+  try {
+    const templates = await listTemplates(req.owner.businessId);
+    return res.json({ templates });
+  } catch (err) {
+    console.error('[Campaign Templates] List error:', err.message);
+    return res.status(500).json({ error: 'Failed to load templates' });
+  }
+});
+
+router.post('/campaign-templates', async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Template name is required' });
+  try {
+    const template = await createTemplate({
+      businessId: req.owner.businessId,
+      name,
+      description: req.body?.description || null,
+      sendMode: req.body?.sendMode || 'text',
+      metaTemplateName: req.body?.metaTemplateName || null,
+      templateLanguage: req.body?.templateLanguage || 'en',
+      contentText: req.body?.contentText || null,
+      contentMediaUrl: req.body?.contentMediaUrl || null,
+      variableCount: Number(req.body?.variableCount || 0),
+      variableLabels: req.body?.variableLabels || [],
+    });
+    return res.status(201).json({ template });
+  } catch (err) {
+    console.error('[Campaign Templates] Create error:', err.message);
+    return res.status(500).json({ error: 'Failed to create template' });
+  }
+});
+
+router.get('/campaign-templates/:id', async (req, res) => {
+  const templateId = Number(req.params.id);
+  if (!templateId || Number.isNaN(templateId)) return res.status(400).json({ error: 'Invalid template id' });
+  try {
+    const template = await getTemplate({ businessId: req.owner.businessId, templateId });
+    if (!template) return res.status(404).json({ error: 'Template not found' });
+    return res.json({ template });
+  } catch (err) {
+    console.error('[Campaign Templates] Get error:', err.message);
+    return res.status(500).json({ error: 'Failed to load template' });
+  }
+});
+
+router.put('/campaign-templates/:id', async (req, res) => {
+  const templateId = Number(req.params.id);
+  if (!templateId || Number.isNaN(templateId)) return res.status(400).json({ error: 'Invalid template id' });
+  try {
+    const template = await updateTemplate({
+      businessId: req.owner.businessId,
+      templateId,
+      name: req.body?.name,
+      description: req.body?.description,
+      sendMode: req.body?.sendMode,
+      metaTemplateName: req.body?.metaTemplateName,
+      templateLanguage: req.body?.templateLanguage,
+      contentText: req.body?.contentText,
+      contentMediaUrl: req.body?.contentMediaUrl,
+      variableCount: req.body?.variableCount,
+      variableLabels: req.body?.variableLabels,
+    });
+    if (!template) return res.status(404).json({ error: 'Template not found' });
+    return res.json({ template });
+  } catch (err) {
+    console.error('[Campaign Templates] Update error:', err.message);
+    return res.status(500).json({ error: 'Failed to update template' });
+  }
+});
+
+router.delete('/campaign-templates/:id', async (req, res) => {
+  const templateId = Number(req.params.id);
+  if (!templateId || Number.isNaN(templateId)) return res.status(400).json({ error: 'Invalid template id' });
+  try {
+    await deleteTemplate({ businessId: req.owner.businessId, templateId });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[Campaign Templates] Delete error:', err.message);
+    return res.status(500).json({ error: 'Failed to delete template' });
   }
 });
 
