@@ -714,6 +714,11 @@ router.post('/hours', async (req, res) => {
 router.get('/appointments', async (req, res) => {
   try {
     const bId = req.owner.businessId;
+    if (!bId) {
+      console.error('[Appointments] No businessId in request');
+      return res.status(401).json({ error: 'Business ID not found. Please log in again.' });
+    }
+
     const {
       view   = 'today',   // today | upcoming | all | range
       status,             // confirmed | cancelled | completed
@@ -726,6 +731,10 @@ router.get('/appointments', async (req, res) => {
     } = req.query;
 
     const business = await getBusiness(bId);
+    if (!business) {
+      console.error('[Appointments] Business not found for ID:', bId);
+      return res.status(404).json({ error: 'Business not found' });
+    }
     const tz = business?.timezone || 'Asia/Kolkata';
 
     // Params: $1 = businessId, $2 = business timezone (used for "today" and "range" filtering)
@@ -861,10 +870,12 @@ router.get('/appointments', async (req, res) => {
       appointments: rows,
       total,
       page: parseInt(page, 10),
-      pages: Math.ceil(total / parseInt(limit, 10)),
+      pages: Math.max(Math.ceil(total / parseInt(limit, 10)), 1),
     });
   } catch (err) {
     console.error('[Appointments] Error:', err);
+    console.error('[Appointments] Query params:', req.query);
+    console.error('[Appointments] Business ID:', req.owner?.businessId);
     res.status(500).json({ error: 'Failed to load appointments' });
   }
 });
