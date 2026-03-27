@@ -283,6 +283,9 @@ async function handleMessage({
     businessType = business?.type  || null;
     const businessTZ   = business?.timezone || 'Asia/Kolkata';
 
+    // Normalize message for keyword matching
+    const msgNorm = normForKeywords(messageForIntent);
+
     // ── Compliance fast-path: STOP / START for campaign messaging ────────────
     if (KEYWORD_GLOBAL_STOP.test(msgNorm)) {
       await setCampaignOptOut({
@@ -306,7 +309,6 @@ async function handleMessage({
     }
 
     // ── HELP fast-path ────────────────────────────────────────────────────────
-    const msgNorm = normForKeywords(messageForIntent);
     if (state === STATES.IDLE && KEYWORD_CONFIRM_ARRIVAL.test(msgNorm)) {
       const confirmedAppt = await markNextPendingAppointmentConfirmedForCustomer(phone, businessId);
       if (confirmedAppt) {

@@ -24,12 +24,16 @@ router.get('/:slug/widget.js', async (req, res) => {
   const biz = await resolveBusiness(req.params.slug);
   if (!biz) return res.status(404).type('application/javascript').send('// Business not found');
 
+  // Use BACKEND_URL env var or construct from request
+  const backendUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+
   const script = `(function () {
     if (window.__appointbotWidgetLoaded) return;
     window.__appointbotWidgetLoaded = true;
     var slug = ${JSON.stringify(biz.slug || req.params.slug)};
+    var backendUrl = ${JSON.stringify(backendUrl)};
     var iframe = document.createElement('iframe');
-    iframe.src = window.location.origin + '/chat/' + encodeURIComponent(slug) + '?embed=1&source=website_chat_widget';
+    iframe.src = backendUrl + '/chat/' + encodeURIComponent(slug) + '?embed=1&source=website_chat_widget';
     iframe.style.position = 'fixed';
     iframe.style.right = '20px';
     iframe.style.bottom = '20px';
