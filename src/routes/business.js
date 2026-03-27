@@ -12,6 +12,14 @@ import {
   getUpcomingAppointments,
   rescheduleAppointmentById,
 } from '../services/appointment.service.js';
+import {
+  createCampaign,
+  getCampaignFailures,
+  listCampaigns,
+  retryFailedRecipients,
+  sendCampaignNow,
+} from '../services/campaign.service.js';
+import { listCampaignOptOutPreferences, setCampaignOptOut } from '../services/messaging-preference.service.js';
 import { curateSlots } from '../utils/formatter.js';
 
 const router = express.Router();
@@ -20,6 +28,433 @@ router.use(requireAuth);
 // ─── Helper: slugify ──────────────────────────────────────────────────────────
 function slugify(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+}
+
+function normalizePhone(phone) {
+  return String(phone || '')
+    .replace(/^whatsapp:/i, '')
+    .replace(/^\+/, '')
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+/** Booking counts for a business using its IANA timezone (not server-local dates). */
+async function fetchStatsForBusiness(bId, tz) {
+  const [todayRes, monthRes, totalRes, subRes] = await Promise.all([
+    query(
+      `SELECT COUNT(*) AS n FROM appointments WHERE business_id = $1 AND DATE(scheduled_at AT TIME ZONE $2) = DATE(NOW() AT TIME ZONE $2) AND status != 'cancelled'`,
+      [bId, tz],
+    ),
+    query(
+      `SELECT COUNT(*) AS n FROM appointments WHERE business_id = $1 AND to_char(scheduled_at AT TIME ZONE $2, 'YYYY-MM') = to_char(NOW() AT TIME ZONE $2, 'YYYY-MM') AND status != 'cancelled'`,
+      [bId, tz],
+    ),
+    query(`SELECT COUNT(*) AS n FROM appointments WHERE business_id = $1 AND status != 'cancelled'`, [bId]),
+    query(`SELECT plan FROM subscriptions WHERE business_id = $1`, [bId]),
+  ]);
+  const plan = subRes.rows[0]?.plan || 'free';
+  return {
+    today: parseInt(todayRes.rows[0].n, 10),
+    thisMonth: parseInt(monthRes.rows[0].n, 10),
+    total: parseInt(totalRes.rows[0].n, 10),
+    plan,
+    limits: PLAN_LIMITS[plan],
+  };
+}
+
+/** Dashboard insights from booking + event history. */
+async function fetchDashboardInsights(bId, tz, leadWindowDays = 30) {
+  const safeLeadWindowDays = [7, 30, 90].includes(Number(leadWindowDays)) ? Number(leadWindowDays) : 30;
+  const [kpiRes, bookingsPerDayRes, noShowTrendRes, riskCustomersRes, leadMetricsRes, leadSourceRes, funnelTimelineRes, campaignPerfRes, utmPerfRes, campaignSummaryRes] = await Promise.all([
+    query(
+      `WITH base AS (
+         SELECT
+           COUNT(*) FILTER (
+             WHERE a.scheduled_at >= NOW() - INTERVAL '30 days'
+               AND a.status IN ('confirmed', 'completed', 'cancelled', 'no_show')
+           ) AS total_30d,
+           COUNT(*) FILTER (
+             WHERE a.scheduled_at >= NOW() - INTERVAL '30 days'
+               AND a.status = 'completed'
+           ) AS completed_30d,
+           COALESCE(SUM(CASE
+             WHEN a.scheduled_at >= NOW() - INTERVAL '30 days' AND a.status = 'completed'
+             THEN COALESCE(s.price, 0)
+             ELSE 0
+           END), 0) AS revenue_30d
+         FROM appointments a
+         LEFT JOIN services s ON a.service_id = s.id
+         WHERE a.business_id = $1
+       ),
+       repeaters AS (
+         SELECT COUNT(*) AS repeat_customers_90d
+         FROM (
+           SELECT a.customer_phone
+           FROM appointments a
+           WHERE a.business_id = $1
+             AND a.scheduled_at >= NOW() - INTERVAL '90 days'
+             AND a.status = 'completed'
+           GROUP BY a.customer_phone
+           HAVING COUNT(*) >= 2
+         ) t
+       ),
+       customer_base AS (
+         SELECT COUNT(DISTINCT a.customer_phone) AS customers_90d
+         FROM appointments a
+         WHERE a.business_id = $1
+           AND a.scheduled_at >= NOW() - INTERVAL '90 days'
+           AND a.status = 'completed'
+       ),
+       no_show AS (
+         SELECT COUNT(*) AS auto_cancel_30d
+         FROM appointment_events e
+         WHERE e.business_id = $1
+           AND e.event_type = 'appointment_auto_cancelled'
+           AND e.created_at >= NOW() - INTERVAL '30 days'
+       )
+       SELECT
+         b.total_30d,
+         b.completed_30d,
+         b.revenue_30d,
+         n.auto_cancel_30d,
+         r.repeat_customers_90d,
+         c.customers_90d
+       FROM base b, no_show n, repeaters r, customer_base c`,
+      [bId],
+    ),
+    query(
+      `SELECT
+         DATE(a.scheduled_at AT TIME ZONE $2) AS day,
+         COUNT(*)::int AS bookings
+       FROM appointments a
+       WHERE a.business_id = $1
+         AND a.scheduled_at >= NOW() - INTERVAL '7 days'
+         AND a.status != 'cancelled'
+       GROUP BY DATE(a.scheduled_at AT TIME ZONE $2)
+       ORDER BY day ASC`,
+      [bId, tz],
+    ),
+    query(
+      `SELECT
+         DATE(e.created_at AT TIME ZONE $2) AS day,
+         COUNT(*)::int AS auto_cancellations
+       FROM appointment_events e
+       WHERE e.business_id = $1
+         AND e.event_type = 'appointment_auto_cancelled'
+         AND e.created_at >= NOW() - INTERVAL '14 days'
+       GROUP BY DATE(e.created_at AT TIME ZONE $2)
+       ORDER BY day ASC`,
+      [bId, tz],
+    ),
+    query(
+      `WITH customer_stats AS (
+         SELECT
+           a.customer_phone,
+           COALESCE(MAX(c.name), '') AS customer_name,
+           COUNT(*) FILTER (
+             WHERE a.scheduled_at >= NOW() - INTERVAL '120 days'
+               AND a.status IN ('completed', 'confirmed', 'cancelled', 'no_show')
+           ) AS total_120d,
+           COUNT(*) FILTER (
+             WHERE a.scheduled_at >= NOW() - INTERVAL '120 days'
+               AND (
+                 a.status = 'no_show'
+                 OR (a.status = 'cancelled' AND a.cancel_reason = 'auto_cancel_unconfirmed')
+               )
+           ) AS no_show_120d
+         FROM appointments a
+         LEFT JOIN customers c
+           ON c.phone = a.customer_phone
+          AND c.business_id = a.business_id
+         WHERE a.business_id = $1
+         GROUP BY a.customer_phone
+       )
+       SELECT
+         customer_phone,
+         customer_name,
+         total_120d,
+         no_show_120d,
+         CASE
+           WHEN total_120d = 0 THEN 0
+           ELSE ROUND((no_show_120d::numeric / total_120d::numeric) * 100, 2)
+         END AS no_show_rate_pct
+       FROM customer_stats
+       WHERE total_120d >= 2
+       ORDER BY no_show_120d DESC, no_show_rate_pct DESC, total_120d DESC
+       LIMIT 5`,
+      [bId],
+    ),
+    query(
+      `WITH lead_base AS (
+         SELECT
+           COUNT(*) FILTER (WHERE l.first_seen_at >= NOW() - make_interval(days => $2::int))::int AS leads_30d,
+           COUNT(*) FILTER (
+             WHERE l.first_seen_at >= NOW() - make_interval(days => $2::int)
+               AND l.status = 'converted'
+           )::int AS converted_30d
+         FROM leads l
+         WHERE l.business_id = $1
+       ),
+       dropped AS (
+         SELECT
+           COUNT(*)::int AS dropped_30d
+         FROM lead_events e
+         WHERE e.business_id = $1
+           AND e.event_type = 'lead_dropped_auto'
+           AND e.created_at >= NOW() - make_interval(days => $2::int)
+       )
+       SELECT
+         lb.leads_30d,
+         lb.converted_30d,
+         d.dropped_30d
+       FROM lead_base lb, dropped d`,
+      [bId, safeLeadWindowDays],
+    ),
+    query(
+      `SELECT
+         COALESCE(NULLIF(l.source, ''), 'unknown') AS source,
+         COUNT(*)::int AS leads
+       FROM leads l
+       WHERE l.business_id = $1
+        AND l.first_seen_at >= NOW() - make_interval(days => $2::int)
+       GROUP BY COALESCE(NULLIF(l.source, ''), 'unknown')
+       ORDER BY leads DESC`,
+      [bId, safeLeadWindowDays],
+    ),
+    query(
+      `WITH days AS (
+         SELECT generate_series(
+           DATE((NOW() - INTERVAL '13 days') AT TIME ZONE $2),
+           DATE(NOW() AT TIME ZONE $2),
+           INTERVAL '1 day'
+         )::date AS day
+       ),
+       created AS (
+         SELECT DATE(l.first_seen_at AT TIME ZONE $2) AS day, COUNT(*)::int AS n
+         FROM leads l
+         WHERE l.business_id = $1
+           AND l.first_seen_at >= NOW() - INTERVAL '14 days'
+         GROUP BY DATE(l.first_seen_at AT TIME ZONE $2)
+       ),
+       converted AS (
+         SELECT DATE(l.converted_at AT TIME ZONE $2) AS day, COUNT(*)::int AS n
+         FROM leads l
+         WHERE l.business_id = $1
+           AND l.converted_at IS NOT NULL
+           AND l.converted_at >= NOW() - INTERVAL '14 days'
+         GROUP BY DATE(l.converted_at AT TIME ZONE $2)
+       ),
+       dropped AS (
+         SELECT DATE(e.created_at AT TIME ZONE $2) AS day, COUNT(*)::int AS n
+         FROM lead_events e
+         WHERE e.business_id = $1
+           AND e.event_type = 'lead_dropped_auto'
+           AND e.created_at >= NOW() - INTERVAL '14 days'
+         GROUP BY DATE(e.created_at AT TIME ZONE $2)
+       )
+       SELECT
+         d.day,
+         COALESCE(c.n, 0) AS leads_created,
+         COALESCE(cv.n, 0) AS leads_converted,
+         COALESCE(dr.n, 0) AS leads_dropped
+       FROM days d
+       LEFT JOIN created c ON c.day = d.day
+       LEFT JOIN converted cv ON cv.day = d.day
+       LEFT JOIN dropped dr ON dr.day = d.day
+       ORDER BY d.day ASC`,
+      [bId, tz],
+    ),
+    query(
+      `WITH lead_attr AS (
+         SELECT DISTINCT ON (e.lead_id)
+           e.lead_id,
+           COALESCE(NULLIF(e.event_data->>'campaign', ''), 'unknown') AS campaign
+         FROM lead_events e
+         WHERE e.business_id = $1
+           AND e.event_type = 'lead_message_received'
+         ORDER BY e.lead_id, e.created_at DESC
+       ),
+       lead_base AS (
+         SELECT
+           l.id,
+           COALESCE(la.campaign, 'unknown') AS campaign,
+           l.first_seen_at,
+           l.converted_at
+         FROM leads l
+         LEFT JOIN lead_attr la ON la.lead_id = l.id
+         WHERE l.business_id = $1
+       ),
+       dropped AS (
+         SELECT
+           COALESCE(la.campaign, 'unknown') AS campaign,
+           COUNT(*)::int AS dropped
+         FROM lead_events e
+         LEFT JOIN lead_attr la ON la.lead_id = e.lead_id
+         WHERE e.business_id = $1
+           AND e.event_type = 'lead_dropped_auto'
+           AND e.created_at >= NOW() - make_interval(days => $2::int)
+         GROUP BY COALESCE(la.campaign, 'unknown')
+       )
+       SELECT
+         lb.campaign,
+         COUNT(*) FILTER (WHERE lb.first_seen_at >= NOW() - make_interval(days => $2::int))::int AS leads,
+         COUNT(*) FILTER (WHERE lb.converted_at >= NOW() - make_interval(days => $2::int))::int AS converted,
+         COALESCE(d.dropped, 0)::int AS dropped
+       FROM lead_base lb
+       LEFT JOIN dropped d ON d.campaign = lb.campaign
+       GROUP BY lb.campaign, d.dropped
+       HAVING COUNT(*) FILTER (WHERE lb.first_seen_at >= NOW() - make_interval(days => $2::int)) > 0
+       ORDER BY leads DESC, converted DESC`,
+      [bId, safeLeadWindowDays],
+    ),
+    query(
+      `WITH lead_attr AS (
+         SELECT DISTINCT ON (e.lead_id)
+           e.lead_id,
+           COALESCE(NULLIF(e.event_data->>'utmSource', ''), 'unknown') AS utm_source
+         FROM lead_events e
+         WHERE e.business_id = $1
+           AND e.event_type = 'lead_message_received'
+         ORDER BY e.lead_id, e.created_at DESC
+       ),
+       lead_base AS (
+         SELECT
+           l.id,
+           COALESCE(la.utm_source, 'unknown') AS utm_source,
+           l.first_seen_at,
+           l.converted_at
+         FROM leads l
+         LEFT JOIN lead_attr la ON la.lead_id = l.id
+         WHERE l.business_id = $1
+       ),
+       dropped AS (
+         SELECT
+           COALESCE(la.utm_source, 'unknown') AS utm_source,
+           COUNT(*)::int AS dropped
+         FROM lead_events e
+         LEFT JOIN lead_attr la ON la.lead_id = e.lead_id
+         WHERE e.business_id = $1
+           AND e.event_type = 'lead_dropped_auto'
+           AND e.created_at >= NOW() - make_interval(days => $2::int)
+         GROUP BY COALESCE(la.utm_source, 'unknown')
+       )
+       SELECT
+         lb.utm_source,
+         COUNT(*) FILTER (WHERE lb.first_seen_at >= NOW() - make_interval(days => $2::int))::int AS leads,
+         COUNT(*) FILTER (WHERE lb.converted_at >= NOW() - make_interval(days => $2::int))::int AS converted,
+         COALESCE(d.dropped, 0)::int AS dropped
+       FROM lead_base lb
+       LEFT JOIN dropped d ON d.utm_source = lb.utm_source
+       GROUP BY lb.utm_source, d.dropped
+       HAVING COUNT(*) FILTER (WHERE lb.first_seen_at >= NOW() - make_interval(days => $2::int)) > 0
+       ORDER BY leads DESC, converted DESC`,
+      [bId, safeLeadWindowDays],
+    ),
+    query(
+      `SELECT
+         COUNT(*)::int AS campaigns_30d,
+         COALESCE(SUM(total_recipients), 0)::int AS recipients_30d,
+         COALESCE(SUM(sent_count), 0)::int AS sent_30d,
+         COALESCE(SUM(failed_count), 0)::int AS failed_30d
+       FROM campaigns
+       WHERE business_id = $1
+         AND created_at >= NOW() - INTERVAL '30 days'`,
+      [bId],
+    ),
+  ]);
+
+  const row = kpiRes.rows[0] || {};
+  const total30 = Number(row.total_30d || 0);
+  const autoCancel30 = Number(row.auto_cancel_30d || 0);
+  const customers90 = Number(row.customers_90d || 0);
+  const repeaters90 = Number(row.repeat_customers_90d || 0);
+  const leadRow = leadMetricsRes.rows[0] || {};
+  const campaignSummaryRow = campaignSummaryRes.rows[0] || {};
+  const leads = Number(leadRow.leads_30d || 0);
+  const convertedLeads = Number(leadRow.converted_30d || 0);
+  const droppedLeads = Number(leadRow.dropped_30d || 0);
+  const leadConversionRate = leads > 0 ? Number(((convertedLeads / leads) * 100).toFixed(2)) : 0;
+  const campaignSent = Number(campaignSummaryRow.sent_30d || 0);
+  const campaignFailed = Number(campaignSummaryRow.failed_30d || 0);
+  const campaignDeliveryRate = campaignSent + campaignFailed > 0
+    ? Number(((campaignSent / (campaignSent + campaignFailed)) * 100).toFixed(2))
+    : 0;
+  const campaignPerformance = campaignPerfRes.rows.map((r) => {
+    const leads = Number(r.leads || 0);
+    const converted = Number(r.converted || 0);
+    return {
+      campaign: r.campaign,
+      leads,
+      converted,
+      dropped: Number(r.dropped || 0),
+      conversionRate: leads > 0 ? Number(((converted / leads) * 100).toFixed(2)) : 0,
+    };
+  });
+  const utmPerformance = utmPerfRes.rows.map((r) => {
+    const leads = Number(r.leads || 0);
+    const converted = Number(r.converted || 0);
+    return {
+      utmSource: r.utm_source,
+      leads,
+      converted,
+      dropped: Number(r.dropped || 0),
+      conversionRate: leads > 0 ? Number(((converted / leads) * 100).toFixed(2)) : 0,
+    };
+  });
+
+  return {
+    revenue30d: Number(row.revenue_30d || 0),
+    noShowRate30d: total30 > 0 ? Number(((autoCancel30 / total30) * 100).toFixed(2)) : 0,
+    repeatCustomerRate90d: customers90 > 0 ? Number(((repeaters90 / customers90) * 100).toFixed(2)) : 0,
+    bookingsPerDay7d: bookingsPerDayRes.rows.map((r) => ({
+      day: r.day,
+      bookings: Number(r.bookings || 0),
+    })),
+    noShowTrend14d: noShowTrendRes.rows.map((r) => ({
+      day: r.day,
+      autoCancellations: Number(r.auto_cancellations || 0),
+    })),
+    topRiskCustomers: riskCustomersRes.rows.map((r) => ({
+      phone: r.customer_phone,
+      name: r.customer_name || null,
+      totalAppointments120d: Number(r.total_120d || 0),
+      noShows120d: Number(r.no_show_120d || 0),
+      noShowRatePct: Number(r.no_show_rate_pct || 0),
+    })),
+    // Neutral names (preferred; scoped by requested lead window in funnel endpoint).
+    leads,
+    convertedLeads,
+    droppedLeads,
+    leadConversionRate,
+    // Backward-compatible aliases
+    leads30d: leads,
+    convertedLeads30d: convertedLeads,
+    droppedLeads30d: droppedLeads,
+    leadConversionRate30d: leadConversionRate,
+    leadsBySource30d: leadSourceRes.rows.map((r) => ({
+      source: r.source,
+      leads: Number(r.leads || 0),
+    })),
+    leadFunnelTimeline14d: funnelTimelineRes.rows.map((r) => ({
+      day: r.day,
+      leadsCreated: Number(r.leads_created || 0),
+      leadsConverted: Number(r.leads_converted || 0),
+      leadsDropped: Number(r.leads_dropped || 0),
+    })),
+    // Neutral names (preferred)
+    campaignPerformance,
+    utmPerformance,
+    campaignSummary30d: {
+      campaigns: Number(campaignSummaryRow.campaigns_30d || 0),
+      recipients: Number(campaignSummaryRow.recipients_30d || 0),
+      sent: campaignSent,
+      failed: campaignFailed,
+      deliveryRate: campaignDeliveryRate,
+    },
+    // Backward-compatible aliases
+    leadCampaignPerformance30d: campaignPerformance,
+    leadUtmPerformance30d: utmPerformance,
+  };
 }
 
 // ─── POST /api/business/onboard ───────────────────────────────────────────────
@@ -290,9 +725,9 @@ router.get('/appointments', async (req, res) => {
     const params = [bId, tz];
     const conditions = ['a.business_id = $1'];
 
-    // View presets
+    // View presets ("today" = calendar day in business timezone)
     if (view === 'today') {
-      conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) = CURRENT_DATE`);
+      conditions.push(`DATE(a.scheduled_at AT TIME ZONE $2) = DATE(NOW() AT TIME ZONE $2)`);
     } else if (view === 'upcoming') {
       conditions.push(`a.scheduled_at >= NOW()`);
     } else if (view === 'range' && from) {
@@ -306,7 +741,7 @@ router.get('/appointments', async (req, res) => {
     // view === 'all' → no date filter
 
     // Status filter
-    if (status && ['confirmed', 'cancelled', 'completed'].includes(status)) {
+    if (status && ['confirmed', 'cancelled', 'completed', 'no_show'].includes(status)) {
       params.push(status);
       conditions.push(`a.status = $${params.length}`);
     }
@@ -343,11 +778,72 @@ router.get('/appointments', async (req, res) => {
       `SELECT a.*,
               s.name  AS service_name,
               st.name AS staff_name,
-              c.name  AS customer_name
+              c.name  AS customer_name,
+              cr.risk_tier AS customer_risk_tier,
+              cr.no_show_count_120d AS customer_no_show_count_120d
        FROM appointments a
        LEFT JOIN services  s  ON a.service_id  = s.id
        LEFT JOIN staff     st ON a.staff_id    = st.id
        LEFT JOIN customers c  ON a.customer_phone = c.phone AND c.business_id = a.business_id
+       LEFT JOIN (
+         SELECT
+           a2.customer_phone,
+           COUNT(*) FILTER (
+             WHERE a2.scheduled_at >= NOW() - INTERVAL '120 days'
+               AND (
+                 a2.status = 'no_show'
+                 OR (a2.status = 'cancelled' AND a2.cancel_reason = 'auto_cancel_unconfirmed')
+               )
+           ) AS no_show_count_120d,
+           COUNT(*) FILTER (
+             WHERE a2.scheduled_at >= NOW() - INTERVAL '120 days'
+               AND a2.status IN ('completed', 'confirmed', 'cancelled', 'no_show')
+           ) AS total_count_120d,
+           CASE
+             WHEN COUNT(*) FILTER (
+               WHERE a2.scheduled_at >= NOW() - INTERVAL '120 days'
+                 AND a2.status IN ('completed', 'confirmed', 'cancelled', 'no_show')
+             ) >= 3
+             AND (
+               COUNT(*) FILTER (
+                 WHERE a2.scheduled_at >= NOW() - INTERVAL '120 days'
+                   AND (
+                     a2.status = 'no_show'
+                     OR (a2.status = 'cancelled' AND a2.cancel_reason = 'auto_cancel_unconfirmed')
+                   )
+               ) >= 2
+               OR (
+                 COUNT(*) FILTER (
+                   WHERE a2.scheduled_at >= NOW() - INTERVAL '120 days'
+                     AND (
+                       a2.status = 'no_show'
+                       OR (a2.status = 'cancelled' AND a2.cancel_reason = 'auto_cancel_unconfirmed')
+                     )
+                 )::numeric
+                 / NULLIF(
+                   COUNT(*) FILTER (
+                     WHERE a2.scheduled_at >= NOW() - INTERVAL '120 days'
+                       AND a2.status IN ('completed', 'confirmed', 'cancelled', 'no_show')
+                   ),
+                   0
+                 )
+               ) >= 0.4
+             )
+               THEN 'high'
+             WHEN COUNT(*) FILTER (
+               WHERE a2.scheduled_at >= NOW() - INTERVAL '120 days'
+                 AND (
+                   a2.status = 'no_show'
+                   OR (a2.status = 'cancelled' AND a2.cancel_reason = 'auto_cancel_unconfirmed')
+                 )
+             ) >= 1
+               THEN 'medium'
+             ELSE 'low'
+           END AS risk_tier
+         FROM appointments a2
+         WHERE a2.business_id = $1
+         GROUP BY a2.customer_phone
+       ) cr ON cr.customer_phone = a.customer_phone
        WHERE ${where}
        ORDER BY a.scheduled_at ${view === 'upcoming' ? 'ASC' : 'DESC'}
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
@@ -508,26 +1004,368 @@ router.post('/appointments/:id/reschedule', async (req, res) => {
   }
 });
 
+// ─── GET /api/business/customers/:phone/profile ───────────────────────────────
+router.get('/customers/:phone/profile', async (req, res) => {
+  const phone = normalizePhone(req.params.phone);
+  if (!phone) return res.status(400).json({ error: 'Invalid customer phone' });
+
+  try {
+    const bId = req.owner.businessId;
+    const { rows } = await query(
+      `WITH summary AS (
+         SELECT
+           a.customer_phone,
+           COALESCE(MAX(c.name), MAX(a.customer_name), '') AS customer_name,
+           COUNT(*) FILTER (WHERE a.status = 'completed')::int AS completed_visits,
+           COUNT(*)::int AS total_bookings,
+           MAX(a.scheduled_at) FILTER (WHERE a.status = 'completed') AS last_visit_at,
+           COALESCE(SUM(CASE WHEN a.status = 'completed' THEN COALESCE(s.price, 0) ELSE 0 END), 0) AS total_spend
+         FROM appointments a
+         LEFT JOIN customers c ON c.phone = a.customer_phone AND c.business_id = a.business_id
+         LEFT JOIN services s ON s.id = a.service_id
+         WHERE a.business_id = $1
+           AND a.customer_phone = $2
+         GROUP BY a.customer_phone
+       ),
+       risk AS (
+         SELECT
+           COUNT(*) FILTER (
+             WHERE a.scheduled_at >= NOW() - INTERVAL '120 days'
+               AND (
+                 a.status = 'no_show'
+                 OR (a.status = 'cancelled' AND a.cancel_reason = 'auto_cancel_unconfirmed')
+               )
+           )::int AS no_shows_120d,
+           COUNT(*) FILTER (
+             WHERE a.scheduled_at >= NOW() - INTERVAL '120 days'
+               AND a.status IN ('completed', 'confirmed', 'cancelled', 'no_show')
+           )::int AS total_120d
+         FROM appointments a
+         WHERE a.business_id = $1
+           AND a.customer_phone = $2
+       )
+       SELECT
+         s.customer_phone,
+         s.customer_name,
+         s.total_bookings,
+         s.completed_visits,
+         s.last_visit_at,
+         s.total_spend,
+         r.no_shows_120d,
+         r.total_120d,
+         CASE
+           WHEN r.total_120d >= 3 AND (r.no_shows_120d >= 2 OR (r.no_shows_120d::numeric / NULLIF(r.total_120d, 0)) >= 0.4) THEN 'high'
+           WHEN r.no_shows_120d >= 1 THEN 'medium'
+           ELSE 'low'
+         END AS risk_tier
+       FROM summary s, risk r`,
+      [bId, phone],
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    return res.json({ customer: rows[0] });
+  } catch (err) {
+    console.error('[CRM] Profile error:', err);
+    return res.status(500).json({ error: 'Failed to load customer profile' });
+  }
+});
+
+// ─── GET /api/business/customers/:phone/history ───────────────────────────────
+router.get('/customers/:phone/history', async (req, res) => {
+  const phone = normalizePhone(req.params.phone);
+  if (!phone) return res.status(400).json({ error: 'Invalid customer phone' });
+
+  try {
+    const bId = req.owner.businessId;
+    const [historyRes, notesRes] = await Promise.all([
+      query(
+        `SELECT
+           a.id,
+           a.scheduled_at,
+           a.status,
+           a.confirmation_status,
+           a.cancel_reason,
+           a.notes,
+           s.name AS service_name,
+           st.name AS staff_name
+         FROM appointments a
+         LEFT JOIN services s ON s.id = a.service_id
+         LEFT JOIN staff st ON st.id = a.staff_id
+         WHERE a.business_id = $1
+           AND a.customer_phone = $2
+         ORDER BY a.scheduled_at DESC
+         LIMIT 20`,
+        [bId, phone],
+      ),
+      query(
+        `SELECT id, note, created_at
+         FROM customer_notes
+         WHERE business_id = $1
+           AND customer_phone = $2
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        [bId, phone],
+      ),
+    ]);
+
+    return res.json({
+      appointments: historyRes.rows,
+      notes: notesRes.rows,
+    });
+  } catch (err) {
+    console.error('[CRM] History error:', err);
+    return res.status(500).json({ error: 'Failed to load customer history' });
+  }
+});
+
+// ─── POST /api/business/customers/:phone/notes ────────────────────────────────
+router.post('/customers/:phone/notes', async (req, res) => {
+  const phone = normalizePhone(req.params.phone);
+  const note = String(req.body?.note || '').trim();
+  if (!phone) return res.status(400).json({ error: 'Invalid customer phone' });
+  if (!note) return res.status(400).json({ error: 'Note is required' });
+  if (note.length > 1000) return res.status(400).json({ error: 'Note is too long (max 1000 chars)' });
+
+  try {
+    const { rows } = await query(
+      `INSERT INTO customer_notes (business_id, customer_phone, note, created_by_owner_id)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, note, created_at`,
+      [req.owner.businessId, phone, note, req.owner.ownerId || null],
+    );
+    return res.status(201).json({ note: rows[0] });
+  } catch (err) {
+    console.error('[CRM] Add note error:', err);
+    return res.status(500).json({ error: 'Failed to save note' });
+  }
+});
+
+// ─── GET /api/business/customers ───────────────────────────────────────────────
+// Query params: search, sort=risk|last_visit|spend|name, page, limit
+router.get('/customers', async (req, res) => {
+  try {
+    const bId = req.owner.businessId;
+    const {
+      search = '',
+      sort = 'risk',
+      page = 1,
+      limit = 25,
+    } = req.query;
+
+    const safePage = Math.max(parseInt(page, 10) || 1, 1);
+    const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 25, 1), 100);
+    const offset = (safePage - 1) * safeLimit;
+
+    const params = [bId];
+    const conditions = [];
+    if (search) {
+      params.push(`%${String(search).toLowerCase()}%`);
+      conditions.push(`(LOWER(a.customer_phone) LIKE $${params.length} OR LOWER(COALESCE(c.name, a.customer_name, '')) LIKE $${params.length})`);
+    }
+    const where = conditions.length ? `AND ${conditions.join(' AND ')}` : '';
+
+    const orderBy = {
+      risk: `risk_rank DESC, no_shows_120d DESC, last_visit_at DESC NULLS LAST`,
+      last_visit: `last_visit_at DESC NULLS LAST`,
+      spend: `total_spend DESC`,
+      name: `customer_name ASC`,
+    }[sort] || `risk_rank DESC, no_shows_120d DESC, last_visit_at DESC NULLS LAST`;
+
+    const baseSql = `
+      WITH per_customer AS (
+        SELECT
+          a.customer_phone,
+          COALESCE(MAX(c.name), MAX(a.customer_name), '') AS customer_name,
+          COUNT(*)::int AS total_bookings,
+          COUNT(*) FILTER (WHERE a.status = 'completed')::int AS completed_visits,
+          MAX(a.scheduled_at) FILTER (WHERE a.status = 'completed') AS last_visit_at,
+          COALESCE(SUM(CASE WHEN a.status = 'completed' THEN COALESCE(s.price, 0) ELSE 0 END), 0) AS total_spend,
+          COUNT(*) FILTER (
+            WHERE a.scheduled_at >= NOW() - INTERVAL '120 days'
+              AND (
+                a.status = 'no_show'
+                OR (a.status = 'cancelled' AND a.cancel_reason = 'auto_cancel_unconfirmed')
+              )
+          )::int AS no_shows_120d,
+          COUNT(*) FILTER (
+            WHERE a.scheduled_at >= NOW() - INTERVAL '120 days'
+              AND a.status IN ('completed', 'confirmed', 'cancelled', 'no_show')
+          )::int AS total_120d
+        FROM appointments a
+        LEFT JOIN customers c ON c.phone = a.customer_phone AND c.business_id = a.business_id
+        LEFT JOIN services s ON s.id = a.service_id
+        WHERE a.business_id = $1
+        GROUP BY a.customer_phone
+      ),
+      ranked AS (
+        SELECT
+          *,
+          CASE
+            WHEN total_120d >= 3 AND (no_shows_120d >= 2 OR (no_shows_120d::numeric / NULLIF(total_120d, 0)) >= 0.4) THEN 'high'
+            WHEN no_shows_120d >= 1 THEN 'medium'
+            ELSE 'low'
+          END AS risk_tier,
+          CASE
+            WHEN total_120d >= 3 AND (no_shows_120d >= 2 OR (no_shows_120d::numeric / NULLIF(total_120d, 0)) >= 0.4) THEN 3
+            WHEN no_shows_120d >= 1 THEN 2
+            ELSE 1
+          END AS risk_rank
+        FROM per_customer
+      )
+    `;
+
+    const countRes = await query(
+      `${baseSql}
+       SELECT COUNT(*)::int AS n
+       FROM ranked r
+       WHERE 1=1 ${where}`,
+      params,
+    );
+
+    params.push(safeLimit);
+    params.push(offset);
+
+    const { rows } = await query(
+      `${baseSql}
+       SELECT
+         r.customer_phone,
+         r.customer_name,
+         r.total_bookings,
+         r.completed_visits,
+         r.last_visit_at,
+         r.total_spend,
+         r.no_shows_120d,
+         r.total_120d,
+         r.risk_tier
+       FROM ranked r
+       WHERE 1=1 ${where}
+       ORDER BY ${orderBy}
+       LIMIT $${params.length - 1}
+       OFFSET $${params.length}`,
+      params,
+    );
+
+    const total = Number(countRes.rows[0]?.n || 0);
+    return res.json({
+      customers: rows,
+      total,
+      page: safePage,
+      pages: Math.max(Math.ceil(total / safeLimit), 1),
+    });
+  } catch (err) {
+    console.error('[CRM] Customers list error:', err);
+    return res.status(500).json({ error: 'Failed to load customers' });
+  }
+});
+
+// ─── GET /api/business/dashboard ─────────────────────────────────────────────
+router.get('/dashboard', async (req, res) => {
+  try {
+    const bId = req.owner.businessId;
+    const { rows: bizRows } = await query(
+      `SELECT b.*, s.plan FROM businesses b
+       LEFT JOIN subscriptions s ON b.id = s.business_id
+       WHERE b.id = $1`,
+      [bId],
+    );
+    if (!bizRows.length) return res.status(404).json({ error: 'Business not found' });
+    const business = bizRows[0];
+    const tz = business.timezone || 'Asia/Kolkata';
+
+    const [stats, insights, todayList, upcomingList] = await Promise.all([
+      fetchStatsForBusiness(bId, tz),
+      fetchDashboardInsights(bId, tz),
+      query(
+        `SELECT a.*,
+                s.name  AS service_name,
+                st.name AS staff_name,
+                c.name  AS customer_name
+         FROM appointments a
+         LEFT JOIN services  s  ON a.service_id  = s.id
+         LEFT JOIN staff     st ON a.staff_id    = st.id
+         LEFT JOIN customers c  ON a.customer_phone = c.phone AND c.business_id = a.business_id
+         WHERE a.business_id = $1 AND DATE(a.scheduled_at AT TIME ZONE $2) = DATE(NOW() AT TIME ZONE $2)
+         ORDER BY a.scheduled_at ASC
+         LIMIT 50`,
+        [bId, tz],
+      ),
+      query(
+        `SELECT a.*,
+                s.name  AS service_name,
+                st.name AS staff_name,
+                c.name  AS customer_name
+         FROM appointments a
+         LEFT JOIN services  s  ON a.service_id  = s.id
+         LEFT JOIN staff     st ON a.staff_id    = st.id
+         LEFT JOIN customers c  ON a.customer_phone = c.phone AND c.business_id = a.business_id
+         WHERE a.business_id = $1 AND a.scheduled_at >= NOW()
+         ORDER BY a.scheduled_at ASC
+         LIMIT 20`,
+        [bId],
+      ),
+    ]);
+
+    res.json({
+      business,
+      stats,
+      insights,
+      todayAppointments: todayList.rows,
+      upcomingAppointments: upcomingList.rows,
+    });
+  } catch (err) {
+    console.error('[Business] Dashboard error:', err);
+    res.status(500).json({ error: 'Failed to load dashboard' });
+  }
+});
+
 // ─── GET /api/business/stats ──────────────────────────────────────────────────
 router.get('/stats', async (req, res) => {
   try {
     const bId = req.owner.businessId;
-    const [todayRes, monthRes, totalRes, subRes] = await Promise.all([
-      query(`SELECT COUNT(*) AS n FROM appointments WHERE business_id = $1 AND DATE(scheduled_at AT TIME ZONE 'Asia/Kolkata') = CURRENT_DATE AND status = 'confirmed'`, [bId]),
-      query(`SELECT COUNT(*) AS n FROM appointments WHERE business_id = $1 AND DATE_TRUNC('month', scheduled_at) = DATE_TRUNC('month', NOW()) AND status != 'cancelled'`, [bId]),
-      query(`SELECT COUNT(*) AS n FROM appointments WHERE business_id = $1 AND status != 'cancelled'`, [bId]),
-      query(`SELECT plan FROM subscriptions WHERE business_id = $1`, [bId]),
-    ]);
-    const plan = subRes.rows[0]?.plan || 'free';
-    res.json({
-      today:    parseInt(todayRes.rows[0].n, 10),
-      thisMonth: parseInt(monthRes.rows[0].n, 10),
-      total:    parseInt(totalRes.rows[0].n, 10),
-      plan,
-      limits:   PLAN_LIMITS[plan],
-    });
+    const business = await getBusiness(bId);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    const tz = business.timezone || 'Asia/Kolkata';
+    const stats = await fetchStatsForBusiness(bId, tz);
+    res.json(stats);
   } catch (err) {
     res.status(500).json({ error: 'Failed to load stats' });
+  }
+});
+
+// ─── GET /api/business/funnel ─────────────────────────────────────────────────
+router.get('/funnel', async (req, res) => {
+  try {
+    const bId = req.owner.businessId;
+    const requestedDays = Number(req.query.days || 30);
+    const days = [7, 30, 90].includes(requestedDays) ? requestedDays : 30;
+    const business = await getBusiness(bId);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    const insights = await fetchDashboardInsights(bId, business.timezone || 'Asia/Kolkata', days);
+    return res.json({
+      windowDays: days,
+      leads: insights.leads,
+      convertedLeads: insights.convertedLeads,
+      droppedLeads: insights.droppedLeads,
+      leadConversionRate: insights.leadConversionRate,
+      // Backward-compatible aliases
+      leads30d: insights.leads30d,
+      convertedLeads30d: insights.convertedLeads30d,
+      droppedLeads30d: insights.droppedLeads30d,
+      leadConversionRate30d: insights.leadConversionRate30d,
+      leadsBySource30d: insights.leadsBySource30d,
+      timeline14d: insights.leadFunnelTimeline14d,
+      campaignPerformance: insights.campaignPerformance,
+      utmPerformance: insights.utmPerformance,
+      // Backward-compatible aliases
+      campaignPerformance30d: insights.leadCampaignPerformance30d,
+      utmPerformance30d: insights.leadUtmPerformance30d,
+    });
+  } catch (err) {
+    console.error('[Funnel] Error:', err);
+    return res.status(500).json({ error: 'Failed to load funnel data' });
   }
 });
 
@@ -584,6 +1422,76 @@ router.get('/whatsapp', async (req, res) => {
   } catch (err) {
     console.error('[Business] Load WhatsApp config error:', err.message);
     return res.status(500).json({ error: 'Failed to load WhatsApp settings' });
+  }
+});
+
+// ─── GET /api/business/no-show-settings ───────────────────────────────────────
+router.get('/no-show-settings', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT
+         reminder_24h_enabled,
+         reminder_2h_enabled,
+         auto_cancel_unconfirmed_enabled,
+         confirmation_cutoff_minutes
+       FROM businesses
+       WHERE id = $1`,
+      [req.owner.businessId],
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Business not found' });
+    return res.json({ noShowSettings: rows[0] });
+  } catch (err) {
+    console.error('[Business] Load no-show settings error:', err.message);
+    return res.status(500).json({ error: 'Failed to load no-show settings' });
+  }
+});
+
+// ─── PUT /api/business/no-show-settings ───────────────────────────────────────
+router.put('/no-show-settings', async (req, res) => {
+  const {
+    reminder24hEnabled,
+    reminder2hEnabled,
+    autoCancelUnconfirmedEnabled,
+    confirmationCutoffMinutes,
+  } = req.body || {};
+
+  if (
+    confirmationCutoffMinutes != null
+    && (!Number.isInteger(confirmationCutoffMinutes)
+      || confirmationCutoffMinutes < 15
+      || confirmationCutoffMinutes > 360)
+  ) {
+    return res.status(400).json({ error: 'confirmationCutoffMinutes must be an integer between 15 and 360' });
+  }
+
+  try {
+    const { rows } = await query(
+      `UPDATE businesses
+       SET reminder_24h_enabled = COALESCE($1, reminder_24h_enabled),
+           reminder_2h_enabled = COALESCE($2, reminder_2h_enabled),
+           auto_cancel_unconfirmed_enabled = COALESCE($3, auto_cancel_unconfirmed_enabled),
+           confirmation_cutoff_minutes = COALESCE($4, confirmation_cutoff_minutes)
+       WHERE id = $5
+       RETURNING
+         reminder_24h_enabled,
+         reminder_2h_enabled,
+         auto_cancel_unconfirmed_enabled,
+         confirmation_cutoff_minutes`,
+      [
+        typeof reminder24hEnabled === 'boolean' ? reminder24hEnabled : null,
+        typeof reminder2hEnabled === 'boolean' ? reminder2hEnabled : null,
+        typeof autoCancelUnconfirmedEnabled === 'boolean' ? autoCancelUnconfirmedEnabled : null,
+        confirmationCutoffMinutes ?? null,
+        req.owner.businessId,
+      ],
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Business not found' });
+
+    return res.json({ noShowSettings: rows[0] });
+  } catch (err) {
+    console.error('[Business] Update no-show settings error:', err.message);
+    return res.status(500).json({ error: 'Failed to save no-show settings' });
   }
 });
 
@@ -672,6 +1580,219 @@ router.put('/whatsapp', async (req, res) => {
   } catch (err) {
     console.error('[Business] Update WhatsApp config error:', err.message);
     return res.status(500).json({ error: 'Failed to save WhatsApp settings' });
+  }
+});
+
+// ─── Campaigns (marketing) ────────────────────────────────────────────────────
+router.get('/campaigns', async (req, res) => {
+  try {
+    const campaigns = await listCampaigns(req.owner.businessId);
+    return res.json({ campaigns });
+  } catch (err) {
+    console.error('[Campaigns] List error:', err.message);
+    return res.status(500).json({ error: 'Failed to load campaigns' });
+  }
+});
+
+router.post('/campaigns', async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const message = String(req.body?.message || '').trim();
+  const audienceType = String(req.body?.audienceType || 'all_leads').trim();
+  const sendMode = String(req.body?.sendMode || 'text').trim();
+  const templateName = String(req.body?.templateName || '').trim();
+  const templateLanguage = String(req.body?.templateLanguage || 'en').trim();
+  const scheduledAtRaw = req.body?.scheduledAt || null;
+  const scheduledAt = scheduledAtRaw ? new Date(scheduledAtRaw) : null;
+  if (!name) return res.status(400).json({ error: 'Campaign name is required' });
+  if (sendMode === 'text') {
+    if (!message) return res.status(400).json({ error: 'Campaign message is required' });
+    if (message.length > 1024) return res.status(400).json({ error: 'Campaign message too long (max 1024 chars)' });
+  }
+  if (sendMode === 'template' && !templateName) {
+    return res.status(400).json({ error: 'Template name is required for template campaigns' });
+  }
+  if (scheduledAt && Number.isNaN(scheduledAt.getTime())) {
+    return res.status(400).json({ error: 'Invalid scheduledAt datetime' });
+  }
+
+  try {
+    const campaign = await createCampaign({
+      businessId: req.owner.businessId,
+      name,
+      message: message || '',
+      audienceType,
+      sendMode,
+      templateName: templateName || null,
+      templateLanguage: templateLanguage || 'en',
+      scheduledAt: scheduledAt ? scheduledAt.toISOString() : null,
+      createdByOwnerId: req.owner.ownerId || null,
+    });
+    return res.status(201).json({ campaign });
+  } catch (err) {
+    console.error('[Campaigns] Create error:', err.message);
+    return res.status(500).json({ error: 'Failed to create campaign' });
+  }
+});
+
+router.get('/campaigns/summary', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `WITH campaign_base AS (
+         SELECT *
+         FROM campaigns
+         WHERE business_id = $1
+           AND created_at >= NOW() - INTERVAL '30 days'
+       ),
+       retry_stats AS (
+         SELECT
+           COUNT(*) FILTER (WHERE cr.status = 'failed' AND cr.next_retry_at IS NOT NULL)::int AS retry_pending_30d,
+           COUNT(*) FILTER (WHERE cr.status = 'failed' AND cr.next_retry_at IS NULL)::int AS retry_exhausted_30d
+         FROM campaign_recipients cr
+         JOIN campaign_base c ON c.id = cr.campaign_id
+       )
+       SELECT
+         COUNT(*)::int AS campaigns_30d,
+         COALESCE(SUM(c.total_recipients), 0)::int AS recipients_30d,
+         COALESCE(SUM(c.sent_count), 0)::int AS sent_30d,
+         COALESCE(SUM(c.failed_count), 0)::int AS failed_30d,
+         COALESCE(MAX(rs.retry_pending_30d), 0)::int AS retry_pending_30d,
+         COALESCE(MAX(rs.retry_exhausted_30d), 0)::int AS retry_exhausted_30d
+       FROM campaign_base c
+       CROSS JOIN retry_stats rs`,
+      [req.owner.businessId],
+    );
+    const r = rows[0] || {};
+    const sent = Number(r.sent_30d || 0);
+    const failed = Number(r.failed_30d || 0);
+    const deliveryRate = sent + failed > 0 ? Number(((sent / (sent + failed)) * 100).toFixed(2)) : 0;
+    return res.json({
+      campaigns30d: Number(r.campaigns_30d || 0),
+      recipients30d: Number(r.recipients_30d || 0),
+      sent30d: sent,
+      failed30d: failed,
+      deliveryRate30d: deliveryRate,
+      retryPending30d: Number(r.retry_pending_30d || 0),
+      retryExhausted30d: Number(r.retry_exhausted_30d || 0),
+    });
+  } catch (err) {
+    console.error('[Campaigns] Summary error:', err.message);
+    return res.status(500).json({ error: 'Failed to load campaign summary' });
+  }
+});
+
+router.get('/messaging-preferences', async (req, res) => {
+  try {
+    const optedOutOnly = String(req.query.optedOut || 'true').toLowerCase() !== 'false';
+    if (!optedOutOnly) return res.status(400).json({ error: 'Only optedOut=true is supported currently' });
+    const rows = await listCampaignOptOutPreferences({
+      businessId: req.owner.businessId,
+      search: req.query.search || '',
+      limit: Number(req.query.limit || 100),
+    });
+    return res.json({ contacts: rows });
+  } catch (err) {
+    console.error('[Messaging Preferences] List error:', err.message);
+    return res.status(500).json({ error: 'Failed to load messaging preferences' });
+  }
+});
+
+router.put('/messaging-preferences/:phone', async (req, res) => {
+  const phone = String(req.params.phone || '').trim();
+  const optOut = !!req.body?.optOut;
+  if (!phone) return res.status(400).json({ error: 'phone is required' });
+  try {
+    const pref = await setCampaignOptOut({
+      businessId: req.owner.businessId,
+      customerPhone: phone,
+      optOut,
+      reason: optOut ? (String(req.body?.reason || 'owner_toggle').trim() || 'owner_toggle') : null,
+    });
+    return res.json({ preference: pref });
+  } catch (err) {
+    console.error('[Messaging Preferences] Update error:', err.message);
+    return res.status(500).json({ error: 'Failed to update messaging preference' });
+  }
+});
+
+router.get('/campaigns/:id/failures', async (req, res) => {
+  const campaignId = Number(req.params.id);
+  const limit = Number(req.query.limit || 50);
+  if (!campaignId || Number.isNaN(campaignId)) return res.status(400).json({ error: 'Invalid campaign id' });
+  try {
+    const data = await getCampaignFailures({
+      businessId: req.owner.businessId,
+      campaignId,
+      limit,
+    });
+    return res.json(data);
+  } catch (err) {
+    console.error('[Campaigns] Failures error:', err.message);
+    return res.status(500).json({ error: 'Failed to load campaign failures' });
+  }
+});
+
+router.get('/campaigns/:id/failures.csv', async (req, res) => {
+  const campaignId = Number(req.params.id);
+  if (!campaignId || Number.isNaN(campaignId)) return res.status(400).json({ error: 'Invalid campaign id' });
+  try {
+    const data = await getCampaignFailures({
+      businessId: req.owner.businessId,
+      campaignId,
+      limit: 10000,
+    });
+    const escapeCsv = (v) => {
+      const s = String(v ?? '');
+      if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const lines = [
+      'customer_phone,error_message,failed_at',
+      ...(data.failedRecipients || []).map((r) => [
+        escapeCsv(r.customer_phone),
+        escapeCsv(r.error_message || ''),
+        escapeCsv(r.created_at || ''),
+      ].join(',')),
+    ];
+    const csv = lines.join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="campaign-${campaignId}-failures.csv"`);
+    return res.status(200).send(csv);
+  } catch (err) {
+    console.error('[Campaigns] Failures CSV error:', err.message);
+    return res.status(500).json({ error: 'Failed to export campaign failures CSV' });
+  }
+});
+
+router.post('/campaigns/:id/send', async (req, res) => {
+  const campaignId = Number(req.params.id);
+  if (!campaignId || Number.isNaN(campaignId)) return res.status(400).json({ error: 'Invalid campaign id' });
+  try {
+    const result = await sendCampaignNow({
+      businessId: req.owner.businessId,
+      campaignId,
+    });
+    if (result?.error) return res.status(409).json({ error: result.error });
+    return res.json(result);
+  } catch (err) {
+    console.error('[Campaigns] Send error:', err.message);
+    return res.status(500).json({ error: 'Failed to send campaign' });
+  }
+});
+
+router.post('/campaigns/:id/retry-failed', async (req, res) => {
+  const campaignId = Number(req.params.id);
+  if (!campaignId || Number.isNaN(campaignId)) return res.status(400).json({ error: 'Invalid campaign id' });
+  try {
+    const result = await retryFailedRecipients({
+      businessId: req.owner.businessId,
+      campaignId,
+      max: Number(req.body?.max || 200),
+    });
+    if (result?.error) return res.status(404).json({ error: result.error });
+    return res.json(result);
+  } catch (err) {
+    console.error('[Campaigns] Retry failed error:', err.message);
+    return res.status(500).json({ error: 'Failed to retry failed recipients' });
   }
 });
 

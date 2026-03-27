@@ -216,6 +216,10 @@
 
   // Derive slug from URL path: /chat/:slug
   const slug = location.pathname.split('/').filter(Boolean)[1] || '';
+  const qs = new URLSearchParams(location.search);
+  const leadSource = qs.get('source') || 'chat_page';
+  const campaign = qs.get('campaign') || '';
+  const utmSource = qs.get('utm_source') || '';
   const SEND_URL  = slug ? `/chat/${slug}/send`  : '/chat/send';
   const RESET_URL = slug ? `/chat/${slug}/reset` : '/chat/reset';
 
@@ -268,7 +272,12 @@
       const res = await fetch(SEND_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({
+          message: text,
+          source: leadSource,
+          campaign,
+          utmSource,
+        }),
       });
       const data = await res.json();
       removeTyping();

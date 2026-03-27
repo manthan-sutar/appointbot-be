@@ -1,5 +1,14 @@
 import { query, getClient } from "../config/db.js";
 
+export async function createAppointmentEvent(appointmentId, businessId, eventType, eventData = {}) {
+  if (!appointmentId || !businessId || !eventType) return;
+  await query(
+    `INSERT INTO appointment_events (appointment_id, business_id, event_type, event_data)
+     VALUES ($1, $2, $3, $4::jsonb)`,
+    [appointmentId, businessId, eventType, JSON.stringify(eventData || {})],
+  );
+}
+
 // ─── Timezone utility ────────────────────────────────────────────────────────
 // Convert a date + time expressed in a given IANA timezone to a UTC Date.
 // e.g. localToUTC('2026-03-15', '10:00', 'Asia/Kolkata')  →  Date @ 04:30 UTC
@@ -289,8 +298,14 @@ export async function bookAppointment({
   const { rows } = await query(
     `INSERT INTO appointments
        (business_id, staff_id, service_id, customer_phone, customer_name,
-        scheduled_at, duration_minutes, status, notes)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'confirmed', $8)
+        scheduled_at, duration_minutes, status, notes, confirmation_status, confirmation_deadline_at)
+     VALUES (
+       $1, $2, $3, $4, $5, $6, $7, 'confirmed', $8, 'pending',
+       GREATEST(
+         $6 - make_interval(mins => COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = $1), 90)),
+         NOW()
+       )
+     )
      RETURNING *`,
     [
       businessId,
@@ -303,7 +318,13 @@ export async function bookAppointment({
       notes || null,
     ],
   );
-  return rows[0];
+  const created = rows[0];
+  await createAppointmentEvent(created.id, businessId, "appointment_booked", {
+    source: "booking_flow",
+    staffId,
+    serviceId,
+  });
+  return created;
 }
 
 // ─── Manual/admin booking (customer called) ────────────────────────────────
@@ -445,7 +466,13 @@ export async function cancelAppointment(appointmentId, customerPhone) {
      RETURNING *`,
     [appointmentId, customerPhone],
   );
-  return rows[0] || null;
+  const updated = rows[0] || null;
+  if (updated) {
+    await createAppointmentEvent(updated.id, updated.business_id, "appointment_cancelled", {
+      source: "customer_chat",
+    });
+  }
+  return updated;
 }
 
 // ─── Cancel an appointment (admin/staff context) ──────────────────────────
@@ -457,7 +484,13 @@ export async function cancelAppointmentById(appointmentId, businessId) {
      RETURNING *`,
     [appointmentId, businessId],
   );
-  return rows[0] || null;
+  const updated = rows[0] || null;
+  if (updated) {
+    await createAppointmentEvent(updated.id, businessId, "appointment_cancelled", {
+      source: "business_admin",
+    });
+  }
+  return updated;
 }
 
 // ─── Mark an appointment as completed (admin/staff context) ──────────────
@@ -469,7 +502,13 @@ export async function completeAppointmentById(appointmentId, businessId) {
      RETURNING *`,
     [appointmentId, businessId],
   );
-  return rows[0] || null;
+  const updated = rows[0] || null;
+  if (updated) {
+    await createAppointmentEvent(updated.id, businessId, "appointment_completed", {
+      source: "business_admin",
+    });
+  }
+  return updated;
 }
 
 // ─── Reschedule an appointment ────────────────────────────────────────────────
@@ -483,12 +522,30 @@ export async function rescheduleAppointment(
   const scheduledAt = localToUTC(newDate, newTime, tz);
   const { rows } = await query(
     `UPDATE appointments
-     SET scheduled_at = $1, reminder_sent = FALSE
+     SET scheduled_at = $1,
+         reminder_sent = FALSE,
+         reminder_24h_sent = FALSE,
+         reminder_2h_sent = FALSE,
+         confirmation_status = 'pending',
+         confirmation_deadline_at = GREATEST(
+           $1 - make_interval(mins => COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = appointments.business_id), 90)),
+           NOW()
+         ),
+         auto_cancelled_at = NULL,
+         cancel_reason = NULL
      WHERE id = $2 AND customer_phone = $3 AND status = 'confirmed'
      RETURNING *`,
     [scheduledAt, appointmentId, customerPhone],
   );
-  return rows[0] || null;
+  const updated = rows[0] || null;
+  if (updated) {
+    await createAppointmentEvent(updated.id, updated.business_id, "appointment_rescheduled", {
+      source: "customer_chat",
+      newDate,
+      newTime,
+    });
+  }
+  return updated;
 }
 
 // ─── Reschedule an appointment (admin/staff context) ──────────────────────
@@ -516,12 +573,30 @@ export async function rescheduleAppointmentById(appointmentId, businessId, newDa
   const scheduledAt = localToUTC(newDate, newTime, tz);
   const { rows } = await query(
     `UPDATE appointments
-     SET scheduled_at = $1, reminder_sent = FALSE
+     SET scheduled_at = $1,
+         reminder_sent = FALSE,
+         reminder_24h_sent = FALSE,
+         reminder_2h_sent = FALSE,
+         confirmation_status = 'pending',
+         confirmation_deadline_at = GREATEST(
+           $1 - make_interval(mins => COALESCE((SELECT confirmation_cutoff_minutes FROM businesses WHERE id = $3), 90)),
+           NOW()
+         ),
+         auto_cancelled_at = NULL,
+         cancel_reason = NULL
      WHERE id = $2 AND business_id = $3 AND status = 'confirmed'
      RETURNING *`,
     [scheduledAt, appointmentId, businessId],
   );
-  return rows[0] || null;
+  const updated = rows[0] || null;
+  if (updated) {
+    await createAppointmentEvent(updated.id, businessId, "appointment_rescheduled", {
+      source: "business_admin",
+      newDate,
+      newTime,
+    });
+  }
+  return updated;
 }
 
 // ─── Get available slots across a date range ──────────────────────────────────
@@ -648,4 +723,126 @@ export async function markReminderSent(appointmentId) {
   await query(`UPDATE appointments SET reminder_sent = TRUE WHERE id = $1`, [
     appointmentId,
   ]);
+}
+
+// ─── 24-hour reminders (new no-show flow) ─────────────────────────────────────
+export async function getAppointmentsDueFor24hReminder() {
+  const { rows } = await query(
+    `SELECT a.*, b.name AS business_name, b.timezone AS business_timezone,
+            b.whatsapp_reminder_template,
+            s.name AS service_name, st.name AS staff_name
+     FROM appointments a
+     JOIN businesses b ON a.business_id = b.id
+     LEFT JOIN services s  ON a.service_id = s.id
+     LEFT JOIN staff    st ON a.staff_id   = st.id
+     WHERE a.status            = 'confirmed'
+       AND a.reminder_24h_sent = FALSE
+       AND COALESCE(b.reminder_24h_enabled, TRUE) = TRUE
+       AND a.scheduled_at      BETWEEN NOW() + INTERVAL '23 hours'
+                                  AND NOW() + INTERVAL '25 hours'`,
+    [],
+  );
+  return rows;
+}
+
+export async function markReminder24hSent(appointmentId) {
+  const { rows } = await query(
+    `UPDATE appointments
+     SET reminder_24h_sent = TRUE, reminder_sent = TRUE
+     WHERE id = $1
+     RETURNING id, business_id`,
+    [appointmentId],
+  );
+  if (rows[0]) {
+    await createAppointmentEvent(rows[0].id, rows[0].business_id, "reminder_24h_sent", {});
+  }
+}
+
+// ─── 2-hour reminders requiring customer confirmation ─────────────────────────
+export async function getAppointmentsDueFor2hReminder() {
+  const { rows } = await query(
+    `SELECT a.*, b.name AS business_name, b.timezone AS business_timezone,
+            s.name AS service_name, st.name AS staff_name
+     FROM appointments a
+     JOIN businesses b ON a.business_id = b.id
+     LEFT JOIN services s  ON a.service_id = s.id
+     LEFT JOIN staff    st ON a.staff_id   = st.id
+     WHERE a.status = 'confirmed'
+       AND a.reminder_2h_sent = FALSE
+       AND a.confirmation_status = 'pending'
+       AND COALESCE(b.reminder_2h_enabled, TRUE) = TRUE
+       AND a.scheduled_at BETWEEN NOW() + INTERVAL '105 minutes'
+                             AND NOW() + INTERVAL '135 minutes'`,
+    [],
+  );
+  return rows;
+}
+
+export async function markReminder2hSent(appointmentId) {
+  const { rows } = await query(
+    `UPDATE appointments
+     SET reminder_2h_sent = TRUE
+     WHERE id = $1
+     RETURNING id, business_id`,
+    [appointmentId],
+  );
+  if (rows[0]) {
+    await createAppointmentEvent(rows[0].id, rows[0].business_id, "reminder_2h_sent", {});
+  }
+}
+
+// ─── Customer confirms "Yes I'll come" ────────────────────────────────────────
+export async function markNextPendingAppointmentConfirmedForCustomer(customerPhone, businessId) {
+  const { rows } = await query(
+    `WITH target AS (
+       SELECT id
+       FROM appointments
+       WHERE customer_phone = $1
+         AND business_id    = $2
+         AND status         = 'confirmed'
+         AND confirmation_status = 'pending'
+         AND scheduled_at > NOW()
+       ORDER BY scheduled_at ASC
+       LIMIT 1
+     )
+     UPDATE appointments a
+     SET confirmation_status = 'confirmed'
+     FROM target
+     WHERE a.id = target.id
+     RETURNING a.*`,
+    [customerPhone, businessId],
+  );
+  const updated = rows[0] || null;
+  if (updated) {
+    await createAppointmentEvent(updated.id, businessId, "appointment_confirmed", {
+      source: "whatsapp_confirmation",
+    });
+  }
+  return updated;
+}
+
+// ─── Auto-cancel unconfirmed appointments after deadline ──────────────────────
+export async function autoCancelExpiredUnconfirmedAppointments() {
+  const { rows } = await query(
+    `UPDATE appointments a
+     SET status = 'cancelled',
+         confirmation_status = 'expired',
+         auto_cancelled_at = NOW(),
+         cancel_reason = 'auto_cancel_unconfirmed'
+     FROM businesses b
+     WHERE a.business_id = b.id
+       AND COALESCE(b.auto_cancel_unconfirmed_enabled, TRUE) = TRUE
+       AND a.status = 'confirmed'
+       AND a.confirmation_status = 'pending'
+       AND a.confirmation_deadline_at IS NOT NULL
+       AND a.confirmation_deadline_at <= NOW()
+     RETURNING a.id, a.business_id, a.customer_phone, a.customer_name, a.scheduled_at`,
+    [],
+  );
+  for (const row of rows) {
+    await createAppointmentEvent(row.id, row.business_id, "appointment_auto_cancelled", {
+      reason: "unconfirmed_before_deadline",
+    });
+  }
+  return rows;
 }

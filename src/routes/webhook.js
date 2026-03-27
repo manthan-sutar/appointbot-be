@@ -8,6 +8,7 @@ import {
   bookAppointment, getUpcomingAppointments, cancelAppointment, rescheduleAppointment,
   getLastBookedService, getMostRecentAppointment,
   getCustomerName, upsertCustomer, getBusiness, getBusinessByPhone,
+  markNextPendingAppointmentConfirmedForCustomer,
 } from '../services/appointment.service.js';
 import {
   extractBookingIntent, classifyMessage, extractConfirmation, answerConversational,
@@ -25,6 +26,8 @@ import {
 } from '../utils/formatter.js';
 import { sendWhatsAppTemplate, sendWhatsAppText } from '../services/whatsapp.service.js';
 import { transcribeMetaAudio } from '../services/whisper.service.js';
+import { upsertLeadActivity, trackLeadEvent, markLeadConverted } from '../services/lead.service.js';
+import { setCampaignOptOut } from '../services/messaging-preference.service.js';
 
 const router = express.Router();
 const DEFAULT_BUSINESS_ID = parseInt(process.env.DEFAULT_BUSINESS_ID || '1', 10);
@@ -106,6 +109,25 @@ function normForKeywords(msg) {
   return (msg || '').trim().replace(/[\?\.\!]+$/, '').trim();
 }
 
+function extractAttribution(text) {
+  const raw = String(text || '');
+  const sourceMatch = raw.match(/#src=([a-z0-9_\-]+)/i);
+  const campaignMatch = raw.match(/#cmp=([a-z0-9_\-]+)/i);
+  const utmMatch = raw.match(/#utm=([a-z0-9_\-]+)/i);
+  const cleanMessage = raw
+    .replace(/#src=[a-z0-9_\-]+/ig, '')
+    .replace(/#cmp=[a-z0-9_\-]+/ig, '')
+    .replace(/#utm=[a-z0-9_\-]+/ig, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return {
+    cleanMessage: cleanMessage || raw,
+    source: sourceMatch?.[1] || null,
+    campaign: campaignMatch?.[1] || null,
+    utmSource: utmMatch?.[1] || null,
+  };
+}
+
 const KEYWORD_HELP = /^(help|hi|hello|start|menu|helo|hii|hey|sup|supp|yo)\s*[\?\.\!]*$/i;
 // "What can you do?" / "How can you help?" — treat as HELP so we always show the menu, no LLM/hiccup
 const KEYWORD_HELP_QUESTIONS = /^(what\s+(can\s+)?(you|u)\s+(can\s+)?do|how\s+(can\s+)?(you|u)\s+(can\s+)?help(\s+me)?|what\s+do\s+you\s+do|how\s+(you|u)\s+can\s+(help|assist)(\s+me)?)\s*[\?\.\!]*$/i;
@@ -128,6 +150,9 @@ const KEYWORD_SAME_SERVICE = /\b(same\s+(as\s+)?(last|before|previous|usual|time
 // Post-action acknowledgements — "Great!", "Thanks", "Perfect" etc.
 // Skip the LLM entirely; reply with a brief, context-free thank-you.
 const KEYWORD_ACK = /^(great|thanks|thank\s*you|thankyou|thx|ty|perfect|awesome|excellent|nice|cool|sweet|ok\s*thanks|okay\s*thanks|got\s*it|noted|alright|brilliant|cheers|👍+|🙏+|😊+)[\s\!\.\,🙂😊]*$/i;
+const KEYWORD_CONFIRM_ARRIVAL = /^(yes|yes i['’]?(ll)? come|i['’]?ll come|coming|confirm|confirmed)\s*[\.\!\?]*$/i;
+const KEYWORD_GLOBAL_STOP = /^(stop|unsubscribe|opt\s*out|remove\s*me|stop\s*campaigns?)\s*[\.\!\?]*$/i;
+const KEYWORD_GLOBAL_START = /^(start|subscribe|opt\s*in|resume)\s*[\.\!\?]*$/i;
 
 // ─── Gibberish detector ────────────────────────────────────────────────────────
 // Returns true for obvious keyboard-mash; single-word only (spaces = real phrase).
@@ -181,7 +206,15 @@ router.get('/', (req, res) => {
 });
 
 // ─── Core message handler (shared by WhatsApp Cloud + web chat proxy) ────────
-async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberForRouting }) {
+async function handleMessage({
+  rawPhone,
+  message,
+  explicitBusinessId,
+  toNumberForRouting,
+  leadSource,
+  leadCampaign,
+  leadUtmSource,
+}) {
   console.log('[Webhook] Incoming message payload:', {
     rawPhone,
     explicitBusinessId,
@@ -203,6 +236,8 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
   }
 
   let reply = '';
+  const attribution = extractAttribution(message);
+  const messageForIntent = attribution.cleanMessage;
 
   // Hoist vars used by the nudge scheduler AFTER the try-catch block
   let nextState = null;
@@ -224,12 +259,62 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
       getBusiness(businessId),
     ]);
 
+    const lead = await upsertLeadActivity({
+      businessId,
+      customerPhone: phone,
+      source: leadSource || attribution.source || (explicitBusinessId ? 'website_chat_widget' : 'whatsapp'),
+      status: 'engaged',
+    });
+    if (lead) {
+      await trackLeadEvent({
+        leadId: lead.id,
+        businessId,
+        eventType: 'lead_message_received',
+        eventData: {
+          state,
+          source: leadSource || attribution.source || null,
+          campaign: leadCampaign || attribution.campaign || null,
+          utmSource: leadUtmSource || attribution.utmSource || null,
+        },
+      });
+    }
+
     businessName = business?.name || 'our business';
     businessType = business?.type  || null;
     const businessTZ   = business?.timezone || 'Asia/Kolkata';
 
+    // ── Compliance fast-path: STOP / START for campaign messaging ────────────
+    if (KEYWORD_GLOBAL_STOP.test(msgNorm)) {
+      await setCampaignOptOut({
+        businessId,
+        customerPhone: phone,
+        optOut: true,
+        reason: 'user_stop_keyword',
+      });
+      reply = `You're unsubscribed from promotional campaigns for now.\n\nYou will still receive booking-related messages. Reply *START* anytime to opt back in.`;
+      return { reply, businessId };
+    }
+    if (KEYWORD_GLOBAL_START.test(msgNorm)) {
+      await setCampaignOptOut({
+        businessId,
+        customerPhone: phone,
+        optOut: false,
+        reason: null,
+      });
+      reply = `You're subscribed again for promotional updates.\n\nReply *STOP* anytime to opt out.`;
+      return { reply, businessId };
+    }
+
     // ── HELP fast-path ────────────────────────────────────────────────────────
-    const msgNorm = normForKeywords(message);
+    const msgNorm = normForKeywords(messageForIntent);
+    if (state === STATES.IDLE && KEYWORD_CONFIRM_ARRIVAL.test(msgNorm)) {
+      const confirmedAppt = await markNextPendingAppointmentConfirmedForCustomer(phone, businessId);
+      if (confirmedAppt) {
+        reply = `Perfect, you're confirmed. See you soon!`;
+        return { reply, businessId };
+      }
+    }
+
     if (KEYWORD_HELP.test(msgNorm) || KEYWORD_HELP_QUESTIONS.test(msgNorm)) {
       const services = await getServices(businessId);
       if (state !== STATES.IDLE && temp.serviceName) {
@@ -401,6 +486,11 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
               businessName,
               businessType,
               reminderNote,
+            });
+            await markLeadConverted({
+              businessId,
+              customerPhone: phone,
+              conversionSource: 'whatsapp_booking',
             });
             await resetSession(phone, businessId);
           } catch (err) {
@@ -980,7 +1070,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
       default: {
         // Fast-path: post-action acknowledgements ("Great!", "Thanks", "Perfect")
         // User is just reacting to something that succeeded — no LLM, no booking pitch.
-        if (KEYWORD_ACK.test(message.trim())) {
+        if (KEYWORD_ACK.test(messageForIntent.trim())) {
           const acks = [
             `Glad I could help! 😊 Let me know if you need anything else.`,
             `Of course! Feel free to reach out anytime. 😊`,
@@ -992,9 +1082,9 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
         }
 
         // Fast-path: obvious gibberish (keyboard mash, pure repeats) — no LLM needed
-        if (looksLikeGibberish(message)) {
+        if (looksLikeGibberish(messageForIntent)) {
           try {
-            reply = await answerConversational(message, {
+            reply = await answerConversational(messageForIntent, {
               name: businessName, type: businessType,
             });
             reply = formatShortWhatsAppReply(reply);
@@ -1007,7 +1097,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
         const idleServices = await getServices(businessId);
 
         // Single LLM call returns both handoff flag AND intent (halves latency vs two calls)
-        const classification = await classifyMessage(message, idleServices.map(s => s.name));
+        const classification = await classifyMessage(messageForIntent, idleServices.map(s => s.name));
         const wantsHuman = classification.handoff;
         let intent = classification.intent;
 
@@ -1020,7 +1110,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
 
         // Override: "remind me at X" → reminder (catches LLM misclassifications like "book")
         // Exclude "reschedule" so "remind me to reschedule" stays correct
-        if (intent !== 'reschedule' && KEYWORD_REMINDER_OVERRIDE.test(message)) {
+        if (intent !== 'reschedule' && KEYWORD_REMINDER_OVERRIDE.test(messageForIntent)) {
           intent = 'reminder';
         }
 
@@ -1031,7 +1121,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
 
         // If LLM said "book" but the user clearly meant "book the same again", route to repeat_booking
         // so we prefill *service + staff* from their most recent appointment.
-        if (intent === 'book' && KEYWORD_SAME_SERVICE.test(message)) {
+        if (intent === 'book' && KEYWORD_SAME_SERVICE.test(messageForIntent)) {
           intent = 'repeat_booking';
         }
 
@@ -1109,7 +1199,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
           };
 
           // If they already included a date/time in the same message, proceed immediately.
-          const ri = await extractBookingIntent(message, [], businessTZ);
+          const ri = await extractBookingIntent(messageForIntent, [], businessTZ);
           if (ri?.date) {
             await updateSession(phone, businessId, STATES.AWAITING_DATE, {
               ...prefilled,
@@ -1194,7 +1284,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
             break;
           }
 
-          const bookIntent = await extractBookingIntent(message, services.map(s => s.name), businessTZ);
+          const bookIntent = await extractBookingIntent(messageForIntent, services.map(s => s.name), businessTZ);
 
           let service = null;
           if (bookIntent.service) {
@@ -1382,7 +1472,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
 
             if (delayMs == null) {
               // Fallback to absolute time extraction ("at 7pm today").
-              const ri = await extractBookingIntent(message, [], businessTZ);
+              const ri = await extractBookingIntent(messageForIntent, [], businessTZ);
               if (!ri.time) {
                 reply = `I automatically send you a reminder 24 hours before every appointment — no need to ask! 😊\n\nIf you'd like a reminder at a specific time, just tell me the time (e.g. "remind me at 7pm today").`;
                 break;
@@ -1474,7 +1564,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
 
         // FAQ / conversational / unknown — always give a real, helpful answer
         try {
-          reply = await answerConversational(message, {
+          reply = await answerConversational(messageForIntent, {
             name:     businessName,
             type:     business?.type,
             services: idleServices.map(s => s.name).join(', '),
@@ -1493,8 +1583,8 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
   } catch (err) {
     console.error(`[Webhook] Error handling message from ${rawPhone} (biz ${explicitBusinessId}):`, err);
     // Try lightweight recovery: if they asked for "my bookings", try to fulfill that
-    const msgNorm = normForKeywords(message);
-    if (!/^cancel\s+/i.test(msgNorm) && CONTAINS_MY_BOOKINGS.test(message || '')) {
+    const msgNorm = normForKeywords(messageForIntent);
+    if (!/^cancel\s+/i.test(msgNorm) && CONTAINS_MY_BOOKINGS.test(messageForIntent || '')) {
       try {
       const [appointments, businessRec, savedNameRec] = await Promise.all([
           getUpcomingAppointments(phone, businessId),
@@ -1510,7 +1600,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
       try {
         const businessRec = await getBusiness(businessId);
         const dynamic = await generateDynamicFallbackReply({
-          userMessage: message,
+          userMessage: messageForIntent,
           businessName: businessRec?.name || 'us',
           businessType: businessRec?.type || null,
         });
@@ -1527,7 +1617,7 @@ async function handleMessage({ rawPhone, message, explicitBusinessId, toNumberFo
     try {
       const businessRec = await getBusiness(businessId);
       const dynamic = await generateDynamicFallbackReply({
-        userMessage: message,
+        userMessage: messageForIntent,
         businessName: businessRec?.name || 'us',
         businessType: businessRec?.type || null,
       });
@@ -1621,6 +1711,7 @@ router.post('/', async (req, res) => {
           message,
           explicitBusinessId: null,
           toNumberForRouting: displayNumber,
+          leadSource: 'whatsapp',
         });
         reply = result.reply;
         businessIdForSend = result.businessId;
@@ -1680,6 +1771,9 @@ router.post('/', async (req, res) => {
   const message    = buttonText || body;
   const businessId = req.body.businessId;
   const toNumber   = req.body.To || '';
+  const source = req.body.source || 'website_chat_widget';
+  const campaign = req.body.campaign || null;
+  const utmSource = req.body.utmSource || null;
 
   console.log('[Webhook] Incoming chat proxy payload:', { rawPhone, body, buttonText, businessId, toNumber });
 
@@ -1690,6 +1784,9 @@ router.post('/', async (req, res) => {
       message,
       explicitBusinessId: businessId,
       toNumberForRouting: toNumber,
+      leadSource: source,
+      leadCampaign: campaign,
+      leadUtmSource: utmSource,
     });
     reply = result.reply;
   } catch (err) {

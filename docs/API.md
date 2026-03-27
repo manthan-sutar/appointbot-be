@@ -1,94 +1,78 @@
-# appointbot — API Reference
+# appointbot — API Reference (current)
 
-## Endpoints
+## Core Public Endpoints
 
 ### `GET /health`
 Returns server status.
 
-**Response:**
-```json
-{ "status": "ok", "service": "appointbot" }
-```
-
----
-
 ### `POST /webhook`
-Main bot endpoint. Accepts WhatsApp webhook payloads or a simple JSON body for testing.
+Main bot endpoint for WhatsApp and internal chat proxy payloads.
 
-**Request (JSON — production / testing):**
+### `GET /chat/:slug`
+Serves browser chat UI per business slug.
+
+### `GET /chat/:slug/widget.js`
+Embeddable website chat widget script.
+
+### `POST /chat/:slug/send`
+Proxy a chat message to webhook with optional attribution fields:
+- `message`
+- `source`
+- `campaign`
+- `utmSource`
+
+### `DELETE /chat/:slug/reset`
+Resets test session for chat UI.
+
+## Authenticated Business APIs (`/api/business/*`)
+
+### Dashboard + Funnel
+- `GET /api/business/dashboard`
+- `GET /api/business/funnel?days=7|30|90`
+
+### No-show Settings
+- `GET /api/business/no-show-settings`
+- `PUT /api/business/no-show-settings`
+
+### CRM
+- `GET /api/business/customers`
+- `GET /api/business/customers/:phone/profile`
+- `GET /api/business/customers/:phone/history`
+- `POST /api/business/customers/:phone/notes`
+
+### Campaigns
+- `GET /api/business/campaigns`
+- `POST /api/business/campaigns`
+- `POST /api/business/campaigns/:id/send`
+- `GET /api/business/campaigns/summary`
+- `GET /api/business/campaigns/:id/failures`
+- `GET /api/business/campaigns/:id/failures.csv`
+- `POST /api/business/campaigns/:id/retry-failed`
+
+## Campaign Create Payload (summary)
+
+`POST /api/business/campaigns`
+
 ```json
-{ "From": "+919999999999", "Body": "Book haircut tomorrow at 5pm" }
+{
+  "name": "Festival Offer - April",
+  "audienceType": "all_leads",
+  "sendMode": "text",
+  "message": "Hi! Limited time offer this week...",
+  "templateName": "",
+  "templateLanguage": "en",
+  "scheduledAt": "2026-04-01T10:30:00.000Z"
+}
 ```
 
-**Response:** `text/plain` — the bot's reply message (WhatsApp-formatted)
+Notes:
+- `sendMode` can be `text` or `template`.
+- For `template`, `templateName` is required.
+- `scheduledAt` is optional; when set, scheduler sends automatically when due.
 
----
+## Async Reliability
 
-### `GET /chat`
-Serves the browser-based test chat UI (`public/chat.html`).
-
----
-
-### `POST /chat/send`
-Proxies a message to `/webhook` for the test UI.
-
-**Request:**
-```json
-{ "message": "Book haircut tomorrow at 5pm" }
-```
-
-**Response:**
-```json
-{ "reply": "Please confirm your booking:\n\n..." }
-```
-
----
-
-### `DELETE /chat/reset`
-Clears the test session from the database.
-
-**Response:**
-```json
-{ "ok": true }
-```
-
----
-
-## Conversation States
-
-| State | Description |
-|---|---|
-| `IDLE` | No active flow |
-| `AWAITING_SERVICE` | Waiting for user to pick a service |
-| `AWAITING_DATE` | Waiting for appointment date |
-| `AWAITING_TIME` | Waiting for appointment time |
-| `AWAITING_STAFF` | Waiting for staff selection |
-| `AWAITING_NAME` | Waiting for customer name |
-| `AWAITING_CONFIRMATION` | Waiting for YES/NO to confirm booking |
-| `AWAITING_CANCEL_WHICH` | Waiting for user to pick which appointment to cancel |
-| `AWAITING_RESCHEDULE_DATE` | Waiting for new date during reschedule |
-| `AWAITING_RESCHEDULE_TIME` | Waiting for new time during reschedule |
-
----
-
-## Example Conversation
-
-```
-User:  "Book haircut tomorrow at 5pm"
-Bot:   "Please confirm your booking:
-        📋 Service: Haircut
-        👤 With: Priya
-        📅 Date: Saturday, 28 February 2026
-        🕐 Time: 5:00 PM
-        💰 Price: ₹300
-        Reply YES to confirm or NO to cancel."
-
-User:  "YES"
-Bot:   "✅ Booking Confirmed!
-        📋 Service: Haircut
-        👤 With: Priya
-        📅 Date: Saturday, 28 February 2026
-        🕐 Time: 5:00 PM
-        🔖 Ref #: 42
-        You'll receive a reminder 24 hours before your appointment."
-```
+Scheduler-critical jobs use durable execution records (`async_job_executions`) with:
+- idempotent `job_name + job_key`
+- retry metadata and status
+- safe claim/update semantics to reduce duplicate executions.

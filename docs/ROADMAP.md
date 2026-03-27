@@ -14,14 +14,14 @@ A living document of planned features. Implement gradually, prioritize by impact
 
 ## 🤖 Bot Intelligence
 
-### [ ] Smart Reminders (Day-before follow-up)
+### [x] Smart Reminders + Confirmation + Auto-cancel
 After a booking is confirmed, the bot automatically messages the customer the day before:
 > "Reminder: your Haircut with Priya is **tomorrow at 5:00 PM**. Reply CONFIRM or RESCHEDULE."
 
-- Reduces no-shows significantly
-- Already have a reminder scheduler (`src/services/reminder.service.js`) — extend it
-- Add `reminder_sent` column to `appointments` table to avoid duplicates
-- **Difficulty:** Easy — scheduler + WhatsApp send already exists
+- 24h + 2h reminder flow implemented
+- confirmation keyword flow implemented
+- auto-cancel unconfirmed appointments implemented
+- event logging + dashboard trends added
 
 ---
 
@@ -102,13 +102,12 @@ Every Monday morning, send the owner an email summary:
 
 ---
 
-### [ ] Revenue Dashboard
+### [x] Revenue + No-show + Repeat Dashboard
 Show estimated revenue from bookings in the dashboard.
 
-- `service.price × confirmed_bookings` per day/week/month
-- Simple bar chart (use `recharts` — lightweight React charting library)
-- Add to existing Dashboard stats section
-- **Difficulty:** Easy (UI) / Medium (chart library)
+- Revenue/no-show/repeat metrics implemented
+- lead funnel timeline + source analytics implemented
+- campaign summary analytics implemented
 
 ---
 
@@ -187,13 +186,25 @@ A shareable public page at `/b/priya-salon` with:
 
 ---
 
-### [ ] Embeddable "Book via WhatsApp" Widget
+### [x] Embeddable Website Chat Widget + Tracked Book Now
 A `<script>` tag businesses paste on their website that adds a floating WhatsApp booking button.
 
-- Standalone JS bundle (separate Vite build)
-- Floating button bottom-right, opens WhatsApp deep link on click
-- Configurable: color, text, position
-- **Difficulty:** Medium
+- `GET /chat/:slug/widget.js` floating widget implemented
+- tracked WhatsApp book-now links in settings
+- campaign + utm attribution persisted in lead events
+
+---
+
+## 📣 Marketing Campaigns
+
+### [x] Campaigns MVP+ (send, schedule, reliability)
+- create/list/send campaigns by audience segment
+- text mode and template mode
+- scheduled campaigns processed in scheduler
+- failure drilldown and CSV export
+- manual retry for failed recipients
+- auto-retry with backoff and max attempts
+- campaign delivery analytics in dashboard and campaigns page
 
 ---
 
@@ -230,17 +241,9 @@ Make the dashboard a Progressive Web App so owners can add it to their phone hom
 
 ---
 
-## Implementation Order (Suggested)
+## Remaining High-Priority Work
 
-Start with highest impact, lowest effort:
-
-1. **Custom bot greeting** — owners love personalisation
-2. **Holiday / closure override** — very practical
-3. **Export to CSV** — every business owner asks for this
-4. **Post-appointment review** — builds social proof
-5. **Revenue dashboard** — makes the product feel serious
-6. **Public business profile page** — viral / shareability
-7. **"Book my usual"** — delightful UX
-8. **Weekly digest email** — passive engagement
-9. **Waitlist** — advanced but high value
-10. **Google Calendar sync** — integration that justifies Pro plan
+1. **Docs and API contract alignment** (in progress)
+2. **Async durability hardening** (partially done; continue with queue abstraction/migrations)
+3. **Campaign safeguards** (suppression/opt-out, per-tenant throttle caps)
+4. **Calendar sync / external integrations**
