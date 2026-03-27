@@ -72,6 +72,11 @@ async function updateSubscriptionFromEvent(event) {
     params.push(periodEnd);
   }
 
+  if (status === 'canceled') {
+    sets.push(`cancel_at_period_end = $${sets.length + 1}`);
+    params.push(false);
+  }
+
   if (notedPlan) {
     sets.push(`plan = $${sets.length + 1}`);
     params.push(notedPlan);

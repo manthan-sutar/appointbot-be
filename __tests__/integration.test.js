@@ -150,16 +150,16 @@ describe('Chatbot Integration Tests - End-to-End Flows', () => {
 
     test('should use default source when no tags present', () => {
       const explicitBusinessId = null;
-      const defaultSource = explicitBusinessId ? 'website_chat_widget' : 'whatsapp';
+      const defaultSource = explicitBusinessId ? 'web_chat_widget' : 'whatsapp';
       
       expect(defaultSource).toBe('whatsapp');
     });
 
     test('should use website source for explicit business', () => {
       const explicitBusinessId = 1;
-      const defaultSource = explicitBusinessId ? 'website_chat_widget' : 'whatsapp';
+      const defaultSource = explicitBusinessId ? 'web_chat_widget' : 'whatsapp';
       
-      expect(defaultSource).toBe('website_chat_widget');
+      expect(defaultSource).toBe('web_chat_widget');
     });
   });
 

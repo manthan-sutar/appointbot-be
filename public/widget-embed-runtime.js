@@ -223,7 +223,7 @@
       },
       body: JSON.stringify({
         message: text,
-        source: "website_chat_widget",
+        source: "web_chat_widget",
         campaign: "",
         utmSource: "",
       }),

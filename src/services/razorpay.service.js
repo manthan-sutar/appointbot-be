@@ -56,3 +56,24 @@ export async function createRazorpaySubscription({ businessId, plan, customerEma
   return subscription;
 }
 
+/** @param {boolean} cancelAtCycleEnd - true = access until current period ends (Claude-style) */
+export async function cancelRazorpaySubscription(subscriptionId, cancelAtCycleEnd = true) {
+  if (!client) {
+    throw new Error('RAZORPAY_NOT_CONFIGURED');
+  }
+  if (!subscriptionId) {
+    throw new Error('SUBSCRIPTION_ID_REQUIRED');
+  }
+  return client.subscriptions.cancel(subscriptionId, cancelAtCycleEnd);
+}
+
+export async function fetchRazorpaySubscription(subscriptionId) {
+  if (!client) {
+    throw new Error('RAZORPAY_NOT_CONFIGURED');
+  }
+  if (!subscriptionId) {
+    throw new Error('SUBSCRIPTION_ID_REQUIRED');
+  }
+  return client.subscriptions.fetch(subscriptionId);
+}
+

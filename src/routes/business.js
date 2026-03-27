@@ -226,12 +226,16 @@ async function fetchDashboardInsights(bId, tz, leadWindowDays = 30) {
     ),
     query(
       `SELECT
-         COALESCE(NULLIF(l.source, ''), 'unknown') AS source,
+         CASE
+           WHEN COALESCE(NULLIF(l.source, ''), 'unknown') IN ('chat_page', 'web_chat_page') THEN 'web_chat_page'
+           WHEN COALESCE(NULLIF(l.source, ''), 'unknown') IN ('website_chat_widget', 'web_chat_widget') THEN 'web_chat_widget'
+           ELSE COALESCE(NULLIF(l.source, ''), 'unknown')
+         END AS source,
          COUNT(*)::int AS leads
        FROM leads l
        WHERE l.business_id = $1
         AND l.first_seen_at >= NOW() - make_interval(days => $2::int)
-       GROUP BY COALESCE(NULLIF(l.source, ''), 'unknown')
+       GROUP BY 1
        ORDER BY leads DESC`,
       [bId, safeLeadWindowDays],
     ),

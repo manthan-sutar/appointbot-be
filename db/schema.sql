@@ -39,7 +39,8 @@ ALTER TABLE subscriptions
   ADD COLUMN IF NOT EXISTS current_period_end  TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS gateway             TEXT DEFAULT 'none',
   ADD COLUMN IF NOT EXISTS external_customer_id    TEXT,
-  ADD COLUMN IF NOT EXISTS external_subscription_id TEXT;
+  ADD COLUMN IF NOT EXISTS external_subscription_id TEXT,
+  ADD COLUMN IF NOT EXISTS cancel_at_period_end    BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Staff / providers per business
 CREATE TABLE IF NOT EXISTS staff (

@@ -6,6 +6,10 @@ import { deleteSession } from '../services/session.service.js';
 import { upsertLeadActivity, trackLeadEvent } from '../services/lead.service.js';
 import { validateWidgetApiKeyHeader } from '../middleware/widgetAuth.js';
 import { getPublicBackendUrlForWidget } from '../utils/publicBackendUrl.js';
+import {
+  DEFAULT_WEB_CHAT_WIDGET_SOURCE,
+  LEAD_SOURCE,
+} from '../constants/leadSources.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -60,13 +64,14 @@ const router = express.Router();
 router.post('/chat', validateWidgetApiKeyHeader, async (req, res) => {
   const biz = req.business;
   const { message, source, campaign, utmSource } = req.body || {};
+  const resolvedSource = source || DEFAULT_WEB_CHAT_WIDGET_SOURCE;
   const testPhone = `test-${biz.slug || biz.id}`;
 
   try {
     const lead = await upsertLeadActivity({
       businessId: biz.id,
       customerPhone: testPhone,
-      source: source || 'website_chat_widget',
+      source: resolvedSource,
       status: 'engaged',
     });
     if (lead) {
@@ -75,8 +80,8 @@ router.post('/chat', validateWidgetApiKeyHeader, async (req, res) => {
         businessId: biz.id,
         eventType: 'lead_message_received',
         eventData: {
-          channel: 'chat_widget',
-          source: source || 'website_chat_widget',
+          channel: LEAD_SOURCE.WEB_CHAT_WIDGET,
+          source: resolvedSource,
           campaign: campaign || null,
           utmSource: utmSource || null,
         },
@@ -90,7 +95,7 @@ router.post('/chat', validateWidgetApiKeyHeader, async (req, res) => {
         From: testPhone,
         Body: message,
         businessId: biz.id,
-        source: source || 'website_chat_widget',
+        source: resolvedSource,
         campaign: campaign || null,
         utmSource: utmSource || null,
       }),

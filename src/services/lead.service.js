@@ -63,7 +63,10 @@ export async function markLeadConverted({ businessId, customerPhone, conversionS
       leadId: lead.id,
       businessId,
       eventType: 'lead_converted',
-      eventData: { conversionSource },
+      eventData: {
+        conversionSource,
+        leadSource: lead.source || null,
+      },
     });
   }
   return lead;

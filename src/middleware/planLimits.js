@@ -9,6 +9,7 @@ export const PLAN_LIMITS = {
 /** Exported for GET /api/business/plan and limit checks — same rules. */
 export function effectivePlanFromSubscriptionRow(row) {
   if (!row) return 'free';
+  if (row.status === 'canceled') return 'free';
   // Active trial → treat as pro plan for limits / UI
   if (
     row.status === 'trialing' &&

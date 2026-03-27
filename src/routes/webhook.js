@@ -27,6 +27,10 @@ import {
 import { sendWhatsAppTemplate, sendWhatsAppText } from '../services/whatsapp.service.js';
 import { transcribeMetaAudio } from '../services/whisper.service.js';
 import { upsertLeadActivity, trackLeadEvent, markLeadConverted } from '../services/lead.service.js';
+import {
+  DEFAULT_WEB_CHAT_WIDGET_SOURCE,
+  LEAD_SOURCE,
+} from '../constants/leadSources.js';
 import { setCampaignOptOut } from '../services/messaging-preference.service.js';
 
 const router = express.Router();
@@ -79,6 +83,48 @@ function clearInactivityNudge(phone, businessId) {
     clearTimeout(existing.timeoutId);
     nudgeTimers.delete(key);
   }
+}
+
+// ─── Duplicate inbound message guard (Meta can POST the same message twice) ───
+// WhatsApp Cloud API includes a stable `id` (wamid.*) per inbound message.
+const PROCESSED_WA_MSG_TTL_MS = 48 * 60 * 60 * 1000;
+const PROCESSED_WA_MSG_MAX = 5000;
+const processedWaInboundMessageIds = new Map(); // id → processedAt (ms)
+const inboundWaMessagePending = new Set(); // ids currently being handled (concurrent duplicate POSTs)
+
+function pruneProcessedWaInboundIds(now = Date.now()) {
+  for (const [id, t] of processedWaInboundMessageIds) {
+    if (now - t > PROCESSED_WA_MSG_TTL_MS) processedWaInboundMessageIds.delete(id);
+  }
+  while (processedWaInboundMessageIds.size > PROCESSED_WA_MSG_MAX) {
+    const first = processedWaInboundMessageIds.keys().next().value;
+    if (first === undefined) break;
+    processedWaInboundMessageIds.delete(first);
+  }
+}
+
+/**
+ * Returns 'skip' if this POST should be ignored (already processed or another request is handling it).
+ * Returns 'proceed' if this request should run; in that case `finishInboundWaDedupe` or `abortInboundWaDedupe` must be called.
+ */
+function beginInboundWaDedupe(id) {
+  if (!id || typeof id !== 'string') return 'proceed';
+  pruneProcessedWaInboundIds();
+  if (processedWaInboundMessageIds.has(id)) return 'skip';
+  if (inboundWaMessagePending.has(id)) return 'skip';
+  inboundWaMessagePending.add(id);
+  return 'proceed';
+}
+
+function finishInboundWaDedupe(id) {
+  if (!id || typeof id !== 'string') return;
+  inboundWaMessagePending.delete(id);
+  processedWaInboundMessageIds.set(id, Date.now());
+}
+
+function abortInboundWaDedupe(id) {
+  if (!id || typeof id !== 'string') return;
+  inboundWaMessagePending.delete(id);
 }
 
 // ─── Re-prompt the current step when user says CONTINUE ──────────────────────
@@ -205,6 +251,23 @@ router.get('/', (req, res) => {
   return res.sendStatus(403);
 });
 
+function resolveLeadSourceForWebhook({ explicitBusinessId, leadSource, attribution }) {
+  if (!explicitBusinessId) {
+    return leadSource || attribution.source || LEAD_SOURCE.WHATSAPP;
+  }
+  return leadSource || attribution.source || DEFAULT_WEB_CHAT_WIDGET_SOURCE;
+}
+
+function inferLeadChannel({ explicitBusinessId, resolvedSource }) {
+  if (!explicitBusinessId) return LEAD_SOURCE.WHATSAPP;
+  const s = String(resolvedSource || '').toLowerCase();
+  if (s === LEAD_SOURCE.WEB_CHAT_PAGE || s === 'chat_page') return LEAD_SOURCE.WEB_CHAT_PAGE;
+  if (s === LEAD_SOURCE.WEB_CHAT_WIDGET || s === 'website_chat_widget') {
+    return LEAD_SOURCE.WEB_CHAT_WIDGET;
+  }
+  return LEAD_SOURCE.WEB_CHAT_WIDGET;
+}
+
 // ─── Core message handler (shared by WhatsApp Cloud + web chat proxy) ────────
 async function handleMessage({
   rawPhone,
@@ -259,10 +322,20 @@ async function handleMessage({
       getBusiness(businessId),
     ]);
 
+    const resolvedLeadSource = resolveLeadSourceForWebhook({
+      explicitBusinessId,
+      leadSource,
+      attribution,
+    });
+    const leadChannel = inferLeadChannel({
+      explicitBusinessId,
+      resolvedSource: resolvedLeadSource,
+    });
+
     const lead = await upsertLeadActivity({
       businessId,
       customerPhone: phone,
-      source: leadSource || attribution.source || (explicitBusinessId ? 'website_chat_widget' : 'whatsapp'),
+      source: resolvedLeadSource,
       status: 'engaged',
     });
     if (lead) {
@@ -272,6 +345,7 @@ async function handleMessage({
         eventType: 'lead_message_received',
         eventData: {
           state,
+          channel: leadChannel,
           source: leadSource || attribution.source || null,
           campaign: leadCampaign || attribution.campaign || null,
           utmSource: leadUtmSource || attribution.utmSource || null,
@@ -1665,6 +1739,7 @@ function extractMetaMessageContent(msg) {
 router.post('/', async (req, res) => {
   // WhatsApp Cloud API payload
   if (Array.isArray(req.body.entry)) {
+    let inboundWaId = null;
     try {
       console.log('[Webhook] Incoming WhatsApp Cloud payload:', JSON.stringify(req.body, null, 2));
       const entry    = req.body.entry[0];
@@ -1674,7 +1749,12 @@ router.post('/', async (req, res) => {
 
       if (!messages || !messages.length) return res.sendStatus(200);
 
-      const msg      = messages[0];
+      const msg = messages[0];
+      inboundWaId = msg.id ?? null;
+      if (beginInboundWaDedupe(inboundWaId) === 'skip') {
+        console.log('[Webhook] Skipping duplicate or concurrent inbound WhatsApp message id:', inboundWaId);
+        return res.sendStatus(200);
+      }
       const rawPhone = msg.from || '';
       const displayNumber = value?.metadata?.display_phone_number || '';
 
@@ -1702,6 +1782,7 @@ router.post('/', async (req, res) => {
         } catch (sendErr) {
           console.error('[Webhook] Fallback send failed:', sendErr.message);
         }
+        finishInboundWaDedupe(inboundWaId);
         return res.sendStatus(200);
       }
 
@@ -1740,8 +1821,10 @@ router.post('/', async (req, res) => {
       } catch (sendErr) {
         console.error(`[Webhook] Outbound send failed (biz ${businessIdForSend}):`, sendErr.message);
       }
+      finishInboundWaDedupe(inboundWaId);
       return res.sendStatus(200);
     } catch (err) {
+      abortInboundWaDedupe(inboundWaId);
       console.error('[Webhook] Cloud API error:', err);
       // Don't ghost: try to send a short apology if we have enough from the request
       try {
@@ -1773,7 +1856,7 @@ router.post('/', async (req, res) => {
   const message    = buttonText || body;
   const businessId = req.body.businessId;
   const toNumber   = req.body.To || '';
-  const source = req.body.source || 'website_chat_widget';
+  const source = req.body.source || DEFAULT_WEB_CHAT_WIDGET_SOURCE;
   const campaign = req.body.campaign || null;
   const utmSource = req.body.utmSource || null;
 

@@ -7,6 +7,10 @@ import { getBusinessBySlug, getBusiness } from '../services/appointment.service.
 import { upsertLeadActivity, trackLeadEvent } from '../services/lead.service.js';
 import { validateWidgetApiKey } from '../middleware/widgetAuth.js';
 import { serveWidgetScript } from './widget-public.js';
+import {
+  DEFAULT_WEB_CHAT_PAGE_SOURCE,
+  LEAD_SOURCE,
+} from '../constants/leadSources.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -72,13 +76,14 @@ router.post('/:slug/send', async (req, res) => {
   if (!biz) return res.status(404).json({ reply: 'Business not found' });
 
   const { message, source, campaign, utmSource } = req.body;
+  const resolvedSource = source || DEFAULT_WEB_CHAT_PAGE_SOURCE;
   const testPhone = `test-${biz.slug || biz.id}`;
 
   try {
     const lead = await upsertLeadActivity({
       businessId: biz.id,
       customerPhone: testPhone,
-      source: source || 'website_chat_widget',
+      source: resolvedSource,
       status: 'engaged',
     });
     if (lead) {
@@ -86,7 +91,12 @@ router.post('/:slug/send', async (req, res) => {
         leadId: lead.id,
         businessId: biz.id,
         eventType: 'lead_message_received',
-        eventData: { channel: 'chat_widget', source: source || 'website_chat_widget', campaign: campaign || null, utmSource: utmSource || null },
+        eventData: {
+          channel: LEAD_SOURCE.WEB_CHAT_PAGE,
+          source: resolvedSource,
+          campaign: campaign || null,
+          utmSource: utmSource || null,
+        },
       });
     }
 
@@ -97,7 +107,7 @@ router.post('/:slug/send', async (req, res) => {
         From: testPhone,
         Body: message,
         businessId: biz.id,
-        source: source || 'website_chat_widget',
+        source: resolvedSource,
         campaign: campaign || null,
         utmSource: utmSource || null,
       }),
@@ -114,10 +124,31 @@ router.post('/:slug/send', async (req, res) => {
 router.post('/send', async (req, res) => {
   const biz = await getBusiness(DEFAULT_BUSINESS_ID);
   const slug = biz?.slug || 'default';
-  req.params = { slug };
-  // Re-use slug handler
   const testPhone = `test-${slug}`;
+  const resolvedSource = req.body.source || DEFAULT_WEB_CHAT_PAGE_SOURCE;
+  const { campaign, utmSource } = req.body;
+
   try {
+    const lead = await upsertLeadActivity({
+      businessId: biz?.id || DEFAULT_BUSINESS_ID,
+      customerPhone: testPhone,
+      source: resolvedSource,
+      status: 'engaged',
+    });
+    if (lead) {
+      await trackLeadEvent({
+        leadId: lead.id,
+        businessId: biz?.id || DEFAULT_BUSINESS_ID,
+        eventType: 'lead_message_received',
+        eventData: {
+          channel: LEAD_SOURCE.WEB_CHAT_PAGE,
+          source: resolvedSource,
+          campaign: campaign || null,
+          utmSource: utmSource || null,
+        },
+      });
+    }
+
     const response = await fetch(`${webhookBaseUrl(req)}/webhook`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -125,9 +156,9 @@ router.post('/send', async (req, res) => {
         From: testPhone,
         Body: req.body.message,
         businessId: biz?.id || DEFAULT_BUSINESS_ID,
-        source: req.body.source || 'website_chat_widget',
-        campaign: req.body.campaign || null,
-        utmSource: req.body.utmSource || null,
+        source: resolvedSource,
+        campaign: campaign || null,
+        utmSource: utmSource || null,
       }),
     });
     const text = await response.text();

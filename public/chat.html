@@ -409,7 +409,7 @@
 
   var slug = location.pathname.split('/').filter(Boolean)[1] || '';
   var qs = new URLSearchParams(location.search);
-  var leadSource = qs.get('source') || 'chat_page';
+  var leadSource = qs.get('source') || 'web_chat_page';
   var campaign = qs.get('campaign') || '';
   var utmSource = qs.get('utm_source') || '';
   var SEND_URL = slug ? '/chat/' + encodeURIComponent(slug) + '/send' : '/chat/send';
