@@ -75,9 +75,12 @@
     '<div class="avatar" id="ab-av" aria-hidden="true">✦</div>' +
     '<div class="header-text">' +
     '<div class="header-name" id="ab-name">Appointbot</div>' +
-    '<div class="header-sub">AI Booking Assistant</div>' +
-    '<span class="header-badge">Replies instantly</span></div>' +
-    '<button type="button" class="reset-btn" id="ab-reset">Reset</button></header>' +
+    '<div class="header-sub">AI booking assistant</div></div>' +
+    '<div class="header-actions">' +
+    '<button type="button" class="reset-btn" id="ab-reset">Reset</button>' +
+    '<button type="button" class="close-btn" id="ab-close" aria-label="Close chat">' +
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>' +
+    "</button></div></header>" +
     '<div class="messages" id="ab-msg" role="log" aria-live="polite"></div>' +
     '<div class="quick-cmds" aria-label="Quick actions">' +
     '<button type="button" class="cmd-btn" data-q="HELP">Help</button>' +
@@ -100,10 +103,11 @@
   function setOpen(v) {
     open = v;
     panel.style.display = v ? "block" : "none";
-    btn.setAttribute("aria-label", v ? "Close chat" : "Open chat");
-    btn.innerHTML = v
-      ? '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>'
-      : '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>';
+    // Hide floating launcher while panel is open so it never overlaps the send row.
+    btn.style.display = v ? "none" : "flex";
+    btn.setAttribute("aria-label", "Open chat");
+    btn.innerHTML =
+      '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>';
     if (v) {
       try {
         input.focus();
@@ -112,7 +116,15 @@
   }
 
   btn.addEventListener("click", function () {
-    setOpen(!open);
+    if (!open) setOpen(true);
+  });
+
+  shadow.getElementById("ab-close").addEventListener("click", function () {
+    setOpen(false);
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && open) setOpen(false);
   });
 
   function applyBranding() {
