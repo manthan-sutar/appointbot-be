@@ -33,6 +33,22 @@ async function getEffectivePlan(businessId) {
   return effectivePlanFromSubscriptionRow(rows[0]);
 }
 
+/** Current active staff count and plan limit (for bulk import). */
+export async function getStaffLimitInfo(businessId) {
+  const plan = await getEffectivePlan(businessId);
+  const limit = PLAN_LIMITS[plan].staff;
+  const count = await countRows('staff', businessId);
+  return { plan, limit, count };
+}
+
+/** Current active services count and plan limit (for bulk import). */
+export async function getServicesLimitInfo(businessId) {
+  const plan = await getEffectivePlan(businessId);
+  const limit = PLAN_LIMITS[plan].services;
+  const count = await countRows('services', businessId);
+  return { plan, limit, count };
+}
+
 async function countRows(table, businessId) {
   const { rows } = await query(
     `SELECT COUNT(*) AS n FROM ${table} WHERE business_id = $1 AND active = TRUE`,

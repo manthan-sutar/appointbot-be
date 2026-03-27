@@ -7,6 +7,8 @@ import {
   limitServices,
   PLAN_LIMITS,
   effectivePlanFromSubscriptionRow,
+  getStaffLimitInfo,
+  getServicesLimitInfo,
 } from '../middleware/planLimits.js';
 import {
   cancelAppointmentById,
@@ -577,22 +579,153 @@ router.get('/services', async (req, res) => {
   res.json({ services: rows });
 });
 
+async function insertServiceRow(businessId, name, durationMinutes, price) {
+  const dur = Number.isFinite(durationMinutes) && durationMinutes >= 5 && durationMinutes <= 480
+    ? Math.round(durationMinutes)
+    : 30;
+  const { rows } = await query(
+    `INSERT INTO services (business_id, name, duration_minutes, price)
+     VALUES ($1, $2, $3, $4) RETURNING *`,
+    [businessId, name, dur, price == null ? null : price]
+  );
+  return rows[0];
+}
+
+function parseServiceDuration(val) {
+  if (val == null || val === '') return 30;
+  const n = parseInt(String(val).replace(/[^\d]/g, ''), 10);
+  if (!Number.isFinite(n) || n < 5) return 30;
+  return Math.min(480, n);
+}
+
+function parseServicePrice(val) {
+  if (val == null || val === '') return null;
+  const n = parseFloat(String(val).replace(/[^0-9.]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+/** [{ line, name, duration_minutes, price }] */
+function parseServiceCsvRows(text) {
+  const raw = String(text || '').replace(/^\uFEFF/, '').trim();
+  if (!raw) return [];
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim().length);
+  const firstCells = parseCsvLine(lines[0]).map((c) => c.toLowerCase());
+  const NAME_HEADERS = new Set(['name', 'service', 'service name', 'title', 'offering']);
+  const DURATION_HEADERS = new Set(['duration', 'duration_minutes', 'minutes', 'mins', 'length']);
+  const PRICE_HEADERS = new Set(['price', 'cost', 'amount', 'fee']);
+  const firstIsHeader = firstCells.some(
+    (c) => NAME_HEADERS.has(c) || DURATION_HEADERS.has(c) || PRICE_HEADERS.has(c),
+  );
+  let nameIdx = 0;
+  let durIdx = -1;
+  let priceIdx = -1;
+  let start = 0;
+  if (firstIsHeader) {
+    nameIdx = firstCells.findIndex((c) => NAME_HEADERS.has(c));
+    if (nameIdx < 0) nameIdx = 0;
+    durIdx = firstCells.findIndex((c) => DURATION_HEADERS.has(c));
+    priceIdx = firstCells.findIndex((c) => PRICE_HEADERS.has(c));
+    start = 1;
+  } else {
+    const cells0 = parseCsvLine(lines[0]);
+    if (cells0.length >= 3) {
+      nameIdx = 0;
+      durIdx = 1;
+      priceIdx = 2;
+    } else if (cells0.length === 2) {
+      nameIdx = 0;
+      const rawSecond = cells0[1].trim();
+      const n = parseInt(rawSecond.replace(/[^\d]/g, ''), 10);
+      if (Number.isFinite(n) && n >= 5 && n <= 480) {
+        durIdx = 1;
+      } else {
+        priceIdx = 1;
+      }
+    } else {
+      nameIdx = 0;
+    }
+  }
+  const out = [];
+  for (let i = start; i < lines.length; i++) {
+    const cells = parseCsvLine(lines[i]);
+    const name = (cells[nameIdx] || '').trim();
+    let durationMinutes = 30;
+    let price = null;
+    if (durIdx >= 0) durationMinutes = parseServiceDuration(cells[durIdx]);
+    if (priceIdx >= 0) price = parseServicePrice(cells[priceIdx]);
+    out.push({ line: i + 1, name, duration_minutes: durationMinutes, price });
+  }
+  return out;
+}
+
 // ─── POST /api/business/services ─────────────────────────────────────────────
 router.post('/services', limitServices, async (req, res) => {
   const { name, duration_minutes = 30, price } = req.body;
   if (!name) return res.status(400).json({ error: 'name is required' });
   if (!req.owner.businessId) return res.status(400).json({ error: 'No business linked to your account. Please complete onboarding step 1 first.' });
   try {
-    const { rows } = await query(
-      `INSERT INTO services (business_id, name, duration_minutes, price)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [req.owner.businessId, name, duration_minutes, price || null]
-    );
-    res.status(201).json({ service: rows[0] });
+    const dur = parseServiceDuration(duration_minutes);
+    const p = price === undefined || price === '' ? null : parseServicePrice(price);
+    const service = await insertServiceRow(req.owner.businessId, name, dur, p);
+    res.status(201).json({ service });
   } catch (err) {
     console.error('[Business] Add service error:', err.message);
     res.status(500).json({ error: 'Failed to save service' });
   }
+});
+
+// ─── POST /api/business/services/import ───────────────────────────────────────
+// Body: { csv: string } — columns: name, duration (optional), price (optional). Header optional.
+router.post('/services/import', async (req, res) => {
+  const { csv } = req.body;
+  if (csv == null || typeof csv !== 'string') {
+    return res.status(400).json({ error: 'csv is required (string)' });
+  }
+  const businessId = req.owner.businessId;
+  if (!businessId) {
+    return res.status(400).json({ error: 'No business linked to your account. Please complete onboarding step 1 first.' });
+  }
+
+  const parsed = parseServiceCsvRows(csv);
+  if (!parsed.length) {
+    return res.status(400).json({ error: 'No rows found in CSV.' });
+  }
+
+  let { limit, count } = await getServicesLimitInfo(businessId);
+  const created = [];
+  const errors = [];
+  let skippedEmpty = 0;
+
+  for (const row of parsed) {
+    if (!row.name) {
+      skippedEmpty++;
+      continue;
+    }
+    if (count >= limit) {
+      errors.push({ line: row.line, message: `Plan limit reached (${limit} services).` });
+      break;
+    }
+    try {
+      const service = await insertServiceRow(
+        businessId,
+        row.name,
+        row.duration_minutes,
+        row.price,
+      );
+      created.push(service);
+      count++;
+    } catch (err) {
+      console.error('[Business] service import row error:', err.message);
+      errors.push({ line: row.line, message: `Failed to save: ${err.message || 'unknown error'}` });
+    }
+  }
+
+  res.status(201).json({
+    imported: created.length,
+    skippedEmpty,
+    errors,
+    services: created,
+  });
 });
 
 // ─── PUT /api/business/services/:id ──────────────────────────────────────────
@@ -620,6 +753,77 @@ router.delete('/services/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── Staff CSV helpers ─────────────────────────────────────────────────────────
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQ && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQ = !inQ;
+      }
+    } else if (c === ',' && !inQ) {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out.map((s) => s.trim());
+}
+
+/** Returns [{ line, name, role }] — line is 1-based for error messages. */
+function parseStaffCsvRows(text) {
+  const raw = String(text || '').replace(/^\uFEFF/, '').trim();
+  if (!raw) return [];
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim().length);
+  const firstCells = parseCsvLine(lines[0]).map((c) => c.toLowerCase());
+  const NAME_HEADERS = new Set(['name', 'staff', 'staff name', 'full name', 'employee']);
+  const ROLE_HEADERS = new Set(['role', 'title', 'job', 'position']);
+  const firstIsHeader = firstCells.some((c) => NAME_HEADERS.has(c) || ROLE_HEADERS.has(c));
+  let nameIdx = 0;
+  let roleIdx = -1;
+  let start = 0;
+  if (firstIsHeader) {
+    nameIdx = firstCells.findIndex((c) => NAME_HEADERS.has(c));
+    if (nameIdx < 0) nameIdx = 0;
+    roleIdx = firstCells.findIndex((c) => ROLE_HEADERS.has(c));
+    start = 1;
+  } else if (firstCells.length >= 2) {
+    roleIdx = 1;
+  }
+  const out = [];
+  for (let i = start; i < lines.length; i++) {
+    const cells = parseCsvLine(lines[i]);
+    const name = (cells[nameIdx] || '').trim();
+    const role = roleIdx >= 0 ? (cells[roleIdx] || '').trim() : '';
+    out.push({ line: i + 1, name, role: role || null });
+  }
+  return out;
+}
+
+async function insertStaffWithDefaults(businessId, name, role) {
+  const { rows } = await query(
+    `INSERT INTO staff (business_id, name, role) VALUES ($1, $2, $3) RETURNING *`,
+    [businessId, name, role || null]
+  );
+  const staff = rows[0];
+  for (let day = 1; day <= 6; day++) {
+    await query(
+      `INSERT INTO availability (staff_id, day_of_week, start_time, end_time)
+       VALUES ($1, $2, '09:00', '18:00')`,
+      [staff.id, day]
+    );
+  }
+  return staff;
+}
+
 // ─── GET /api/business/staff ──────────────────────────────────────────────────
 router.get('/staff', async (req, res) => {
   const { rows } = await query(
@@ -636,24 +840,59 @@ router.post('/staff', limitStaff, async (req, res) => {
   if (!name) return res.status(400).json({ error: 'name is required' });
   if (!req.owner.businessId) return res.status(400).json({ error: 'No business linked to your account.' });
   try {
-    const { rows } = await query(
-      `INSERT INTO staff (business_id, name, role) VALUES ($1, $2, $3) RETURNING *`,
-      [req.owner.businessId, name, role || null]
-    );
-    const staff = rows[0];
-    // Default availability: Mon (1)–Sat (6), 09:00–18:00
-    for (let day = 1; day <= 6; day++) {
-      await query(
-        `INSERT INTO availability (staff_id, day_of_week, start_time, end_time)
-         VALUES ($1, $2, '09:00', '18:00')`,
-        [staff.id, day]
-      );
-    }
+    const staff = await insertStaffWithDefaults(req.owner.businessId, name, role || null);
     res.status(201).json({ staff });
   } catch (err) {
     console.error('[Business] Add staff error:', err.message);
     res.status(500).json({ error: 'Failed to save staff' });
   }
+});
+
+// ─── POST /api/business/staff/import ───────────────────────────────────────────
+// Body: { csv: string } — columns: name (required), role (optional). Header row optional.
+router.post('/staff/import', async (req, res) => {
+  const { csv } = req.body;
+  if (csv == null || typeof csv !== 'string') {
+    return res.status(400).json({ error: 'csv is required (string)' });
+  }
+  const businessId = req.owner.businessId;
+  if (!businessId) return res.status(400).json({ error: 'No business linked to your account.' });
+
+  const parsed = parseStaffCsvRows(csv);
+  if (!parsed.length) {
+    return res.status(400).json({ error: 'No rows found in CSV.' });
+  }
+
+  let { limit, count } = await getStaffLimitInfo(businessId);
+  const created = [];
+  const errors = [];
+  let skippedEmpty = 0;
+
+  for (const row of parsed) {
+    if (!row.name) {
+      skippedEmpty++;
+      continue;
+    }
+    if (count >= limit) {
+      errors.push({ line: row.line, message: `Plan limit reached (${limit} staff).` });
+      break;
+    }
+    try {
+      const staff = await insertStaffWithDefaults(businessId, row.name, row.role);
+      created.push(staff);
+      count++;
+    } catch (err) {
+      console.error('[Business] staff import row error:', err.message);
+      errors.push({ line: row.line, message: `Failed to save: ${err.message || 'unknown error'}` });
+    }
+  }
+
+  res.status(201).json({
+    imported: created.length,
+    skippedEmpty,
+    errors,
+    staff: created,
+  });
 });
 
 // ─── PUT /api/business/staff/:id ─────────────────────────────────────────────
