@@ -104,6 +104,21 @@ export async function getBusinessByPhone(phone) {
   return rows[0] || null;
 }
 
+// ─── Get business by WhatsApp phone_number_id (Cloud API webhook metadata) ───
+export async function getBusinessByWhatsAppPhoneNumberId(phoneNumberId) {
+  const normalized = String(phoneNumberId || '').trim();
+  if (!normalized) return null;
+  const { rows } = await query(
+    `SELECT *
+       FROM businesses
+      WHERE whatsapp_phone_number_id = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+    [normalized],
+  );
+  return rows[0] || null;
+}
+
 // ─── Get all active services for a business ───────────────────────────────────
 export async function getServices(businessId) {
   const { rows } = await query(

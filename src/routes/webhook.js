@@ -7,7 +7,7 @@ import {
   getFirstStaffWithSlotsOnDate, localToUTC, findNextSlotNearTime,
   bookAppointment, getUpcomingAppointments, cancelAppointment, rescheduleAppointment,
   getLastBookedService, getMostRecentAppointment,
-  getCustomerName, upsertCustomer, getBusiness, getBusinessByPhone,
+  getCustomerName, upsertCustomer, getBusiness, getBusinessByPhone, getBusinessByWhatsAppPhoneNumberId,
   markNextPendingAppointmentConfirmedForCustomer,
 } from '../services/appointment.service.js';
 import {
@@ -274,6 +274,7 @@ async function handleMessage({
   message,
   explicitBusinessId,
   toNumberForRouting,
+  toPhoneNumberIdForRouting,
   leadSource,
   leadCampaign,
   leadUtmSource,
@@ -289,13 +290,33 @@ async function handleMessage({
   // Resolve business from explicitId, WhatsApp number, or fallback
   let businessId = explicitBusinessId ? parseInt(explicitBusinessId, 10) : null;
   if (!businessId) {
+    const phoneNumberId = String(toPhoneNumberIdForRouting || '').trim();
     const toNumber = toNumberForRouting || '';
-    if (toNumber) {
-      const biz = await getBusinessByPhone(toNumber);
-      businessId = biz?.id || DEFAULT_BUSINESS_ID;
-    } else {
-      businessId = DEFAULT_BUSINESS_ID;
+    if (phoneNumberId) {
+      const biz = await getBusinessByWhatsAppPhoneNumberId(phoneNumberId);
+      businessId = biz?.id || null;
     }
+    if (!businessId && toNumber) {
+      const biz = await getBusinessByPhone(toNumber);
+      businessId = biz?.id || null;
+    }
+    if (!businessId) {
+      const fallback = await getBusiness(DEFAULT_BUSINESS_ID).catch(() => null);
+      businessId = fallback?.id || null;
+    }
+  }
+
+  if (!businessId) {
+    console.error('[Webhook] Unable to resolve business for inbound message:', {
+      explicitBusinessId,
+      toNumberForRouting,
+      toPhoneNumberIdForRouting,
+      defaultBusinessId: DEFAULT_BUSINESS_ID,
+    });
+    return {
+      reply: "Sorry, this WhatsApp number is not linked to an active business yet. Please reconnect WhatsApp in Settings.",
+      businessId: null,
+    };
   }
 
   let reply = '';
@@ -1757,23 +1778,34 @@ router.post('/', async (req, res) => {
       }
       const rawPhone = msg.from || '';
       const displayNumber = value?.metadata?.display_phone_number || '';
+      const phoneNumberId = value?.metadata?.phone_number_id || '';
 
       const { text, audioId, audioMimeType } = extractMetaMessageContent(msg);
       let message = String((text || '').trim());
 
       if (!message && audioId) {
-        const businessId = displayNumber
-          ? ((await getBusinessByPhone(displayNumber))?.id ?? DEFAULT_BUSINESS_ID)
-          : DEFAULT_BUSINESS_ID;
+        const byPhoneNumberId = phoneNumberId
+          ? await getBusinessByWhatsAppPhoneNumberId(phoneNumberId)
+          : null;
+        const byDisplayNumber = !byPhoneNumberId && displayNumber
+          ? await getBusinessByPhone(displayNumber)
+          : null;
+        const fallback = await getBusiness(DEFAULT_BUSINESS_ID).catch(() => null);
+        const businessId = byPhoneNumberId?.id || byDisplayNumber?.id || fallback?.id || null;
         const transcript = await transcribeMetaAudio(audioId, audioMimeType, businessId);
         message = (transcript || '').trim();
       }
 
       if (!message) {
         try {
-          const businessId = displayNumber
-            ? ((await getBusinessByPhone(displayNumber))?.id ?? DEFAULT_BUSINESS_ID)
-            : DEFAULT_BUSINESS_ID;
+          const byPhoneNumberId = phoneNumberId
+            ? await getBusinessByWhatsAppPhoneNumberId(phoneNumberId)
+            : null;
+          const byDisplayNumber = !byPhoneNumberId && displayNumber
+            ? await getBusinessByPhone(displayNumber)
+            : null;
+          const fallback = await getBusiness(DEFAULT_BUSINESS_ID).catch(() => null);
+          const businessId = byPhoneNumberId?.id || byDisplayNumber?.id || fallback?.id || null;
           await sendWhatsAppText(
             rawPhone,
             "Sorry, I couldn't read that message. Please type what you need.",
@@ -1794,6 +1826,7 @@ router.post('/', async (req, res) => {
           message,
           explicitBusinessId: null,
           toNumberForRouting: displayNumber,
+          toPhoneNumberIdForRouting: phoneNumberId,
           leadSource: 'whatsapp',
         });
         reply = result.reply;
@@ -1801,9 +1834,10 @@ router.post('/', async (req, res) => {
       } catch (handleErr) {
         console.error('[Webhook] handleMessage threw:', handleErr);
         try {
-          let businessRec = displayNumber ? await getBusinessByPhone(displayNumber) : null;
+          let businessRec = phoneNumberId ? await getBusinessByWhatsAppPhoneNumberId(phoneNumberId) : null;
+          if (!businessRec && displayNumber) businessRec = await getBusinessByPhone(displayNumber);
           if (!businessRec) businessRec = await getBusiness(DEFAULT_BUSINESS_ID).catch(() => ({}));
-          businessIdForSend = businessRec?.id ?? DEFAULT_BUSINESS_ID;
+          businessIdForSend = businessRec?.id ?? null;
           const dynamic = await generateDynamicFallbackReply({
             userMessage: message,
             businessName: businessRec?.name || 'us',
@@ -1832,10 +1866,16 @@ router.post('/', async (req, res) => {
         const value = entry?.changes?.[0]?.value;
         const from = value?.messages?.[0]?.from;
         const displayNumber = value?.metadata?.display_phone_number;
+        const phoneNumberId = value?.metadata?.phone_number_id;
         if (from) {
-          const businessId = displayNumber
-            ? ((await getBusinessByPhone(displayNumber))?.id ?? DEFAULT_BUSINESS_ID)
-            : DEFAULT_BUSINESS_ID;
+          const byPhoneNumberId = phoneNumberId
+            ? await getBusinessByWhatsAppPhoneNumberId(phoneNumberId)
+            : null;
+          const byDisplayNumber = !byPhoneNumberId && displayNumber
+            ? await getBusinessByPhone(displayNumber)
+            : null;
+          const fallback = await getBusiness(DEFAULT_BUSINESS_ID).catch(() => null);
+          const businessId = byPhoneNumberId?.id || byDisplayNumber?.id || fallback?.id || null;
           await sendWhatsAppText(
             from,
             "Sorry, I hit a small hiccup. Please try again in a moment or type *HELP*. I'm here! 🙂",
