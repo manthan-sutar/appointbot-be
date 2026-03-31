@@ -196,7 +196,9 @@ const KEYWORD_SAME_SERVICE = /\b(same\s+(as\s+)?(last|before|previous|usual|time
 // Post-action acknowledgements — "Great!", "Thanks", "Perfect" etc.
 // Skip the LLM entirely; reply with a brief, context-free thank-you.
 const KEYWORD_ACK = /^(great|thanks|thank\s*you|thankyou|thx|ty|perfect|awesome|excellent|nice|cool|sweet|ok\s*thanks|okay\s*thanks|got\s*it|noted|alright|brilliant|cheers|👍+|🙏+|😊+)[\s\!\.\,🙂😊]*$/i;
-const KEYWORD_CONFIRM_ARRIVAL = /^(yes|yes i['’]?(ll)? come|i['’]?ll come|coming|confirm|confirmed)\s*[\.\!\?]*$/i;
+// Match "Yes I'll come" and common typos: "Yes Il come", "Yes I come", "yes ill come"
+// (strict ^…$ so longer phrases still go to the LLM)
+const KEYWORD_CONFIRM_ARRIVAL = /^(yes|yes i['’]?(?:ll|l)? come|i['’]?(?:ll|l)? come|coming|confirm|confirmed)\s*[\.\!\?]*$/i;
 const KEYWORD_GLOBAL_STOP = /^(stop|unsubscribe|opt\s*out|remove\s*me|stop\s*campaigns?)\s*[\.\!\?]*$/i;
 const KEYWORD_GLOBAL_START = /^(start|subscribe|opt\s*in|resume)\s*[\.\!\?]*$/i;
 
