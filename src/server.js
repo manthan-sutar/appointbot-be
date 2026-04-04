@@ -12,6 +12,7 @@ import authRouter from "./routes/auth.js";
 import businessRouter from "./routes/business.js";
 import whatsappConnectRouter from "./routes/whatsappConnect.js";
 import razorpayWebhookRouter from "./routes/razorpayWebhook.js";
+import demoRouter from "./routes/demo.js";
 import { startReminderScheduler } from "./services/reminder.service.js";
 
 const app = express();
@@ -56,6 +57,7 @@ app.get("/health", (req, res) =>
 );
 
 app.use("/api/auth", authRouter);
+app.use("/api/demo", demoRouter);
 app.use("/api/business", businessRouter);
 app.use("/api/widget", widgetPublicRouter);
 app.get("/widget.js", validateWidgetApiKey, serveWidgetScript);

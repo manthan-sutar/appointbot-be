@@ -328,3 +328,23 @@ CREATE TABLE IF NOT EXISTS campaign_templates (
 
 CREATE INDEX IF NOT EXISTS idx_campaign_templates_business
   ON campaign_templates(business_id, active, created_at DESC);
+
+-- Demo / sales leads (request demo flow; no tenant until admin provisions)
+CREATE TABLE IF NOT EXISTS demo_requests (
+  id SERIAL PRIMARY KEY,
+  business_name VARCHAR(255) NOT NULL,
+  email VARCHAR(255) NOT NULL,
+  phone VARCHAR(30) NOT NULL,
+  business_type VARCHAR(50) NOT NULL,
+  message TEXT,
+  status VARCHAR(50) NOT NULL DEFAULT 'new'
+    CHECK (status IN ('new', 'contacted', 'converted', 'rejected')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_demo_requests_email_lower
+  ON demo_requests (lower(btrim(email)));
+
+CREATE INDEX IF NOT EXISTS idx_demo_requests_created
+  ON demo_requests (created_at DESC);

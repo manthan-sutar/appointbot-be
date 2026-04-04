@@ -7,7 +7,15 @@ const router = express.Router();
 const SALT_ROUNDS = 12;
 
 // ─── POST /api/auth/signup ────────────────────────────────────────────────────
+// Self-service signup is off unless ALLOW_PUBLIC_SIGNUP=true (e.g. local dev only).
 router.post('/signup', async (req, res) => {
+  if (process.env.ALLOW_PUBLIC_SIGNUP !== 'true') {
+    return res.status(403).json({
+      error:
+        'Self-service signup is disabled. Please request a demo from the website, or contact us if you were invited.',
+    });
+  }
+
   const { email, password } = req.body;
 
   if (!email || !password) {
