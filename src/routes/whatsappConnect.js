@@ -5,6 +5,37 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
 
+// ─── Anti-Fraud Safeguards ────────────────────────────────────────────────────
+// Track recent connection attempts to prevent rapid re-connections from different accounts
+const CONNECTION_ATTEMPT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_ATTEMPTS_PER_WINDOW = 2; // Max 2 attempts per 5 minutes per business
+const recentConnectionAttempts = new Map(); // key: businessId → [{ timestamp, wabaId }]
+
+function logConnectionAttempt(businessId, wabaId) {
+  const key = String(businessId);
+  const now = Date.now();
+
+  if (!recentConnectionAttempts.has(key)) {
+    recentConnectionAttempts.set(key, []);
+  }
+
+  const attempts = recentConnectionAttempts.get(key);
+  // Prune old attempts
+  const recentAttempts = attempts.filter(a => now - a.timestamp < CONNECTION_ATTEMPT_WINDOW_MS);
+  recentAttempts.push({ timestamp: now, wabaId });
+  recentConnectionAttempts.set(key, recentAttempts);
+
+  return recentAttempts.length;
+}
+
+function checkTooManyAttempts(businessId) {
+  const key = String(businessId);
+  const attempts = recentConnectionAttempts.get(key) || [];
+  const now = Date.now();
+  const recentAttempts = attempts.filter(a => now - a.timestamp < CONNECTION_ATTEMPT_WINDOW_MS);
+  return recentAttempts.length > MAX_ATTEMPTS_PER_WINDOW;
+}
+
 // ─── Helper: encode/decode state payload ───────────────────────────────────────
 function encodeState(payload) {
   return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
@@ -94,10 +125,24 @@ router.get("/start", requireAuth, (req, res) => {
   const appId = process.env.WHATSAPP_APP_ID;
   const configId = process.env.WHATSAPP_EMBEDDED_CONFIG_ID;
   const apiVersion = process.env.WHATSAPP_API_VERSION || "v21.0";
+  const businessId = req.owner.businessId;
 
   if (!appId || !configId) {
     return res.status(500).json({
       error: "WhatsApp embedded signup is not configured on the server.",
+    });
+  }
+
+  // ─── ANTI-FRAUD: Check for rapid reconnection attempts ─────────────────
+  // This prevents triggering Meta's fraud detection by attempting to connect
+  // the same WABA from multiple accounts in rapid succession.
+  if (checkTooManyAttempts(businessId)) {
+    console.warn(
+      `[WhatsApp Connect] TOO MANY ATTEMPTS (biz ${businessId}) — preventing rapid reconnection to avoid Meta fraud detection. Wait 5 minutes before retrying.`
+    );
+    return res.status(429).json({
+      error: "Too many connection attempts. Please wait 5 minutes before trying again.",
+      retryAfterSeconds: 300,
     });
   }
 
@@ -163,6 +208,47 @@ router.get("/callback", async (req, res) => {
       .replace(/^whatsapp:/i, "")
       .trim();
     const apiVersion = process.env.WHATSAPP_API_VERSION || "v21.0";
+
+    // ─── ANTI-FRAUD: Check if this WABA is already connected to another business ───
+    // If a WABA is being re-authorized from a different account, Meta's fraud detection
+    // may flag it as account takeover. We prevent this by blocking reconnection attempts.
+    try {
+      const { rows: existingConnections } = await query(
+        `SELECT id, whatsapp_business_account_id FROM businesses
+         WHERE whatsapp_business_account_id = $1 AND id != $2`,
+        [waba_id || null, businessId]
+      );
+
+      if (existingConnections.length > 0 && waba_id) {
+        console.error(
+          `[WhatsApp Connect] WABA ${waba_id} is already connected to another business (ID: ${existingConnections[0].id}). ` +
+          `Blocking connection to prevent Meta fraud detection. Please use a different WABA or disconnect the existing one first.`
+        );
+        return res.status(409).send(
+          `<html><head><style>` +
+          `body{font-family:system-ui;padding:24px;background:#f9fafb}` +
+          `.card{max-width:500px;margin:40px auto;background:#fff;padding:24px;border-radius:12px;box-shadow:0 10px 30px rgba(15,23,42,0.08)}` +
+          `h1{font-size:20px;color:#dc2626;margin-bottom:12px}p{font-size:14px;line-height:1.6;color:#374151;margin:6px 0}` +
+          `.warning{background:#fef2f2;border-left:4px solid #dc2626;padding:12px;margin:12px 0;border-radius:4px;font-size:13px}` +
+          `</style></head><body><div class="card">` +
+          `<h1>Cannot Connect This WhatsApp Number</h1>` +
+          `<p>This WhatsApp Business Account is already connected to another business in the system.</p>` +
+          `<div class="warning"><strong>Why?</strong> Meta blocks accounts that appear to be doing account takeover. ` +
+          `To prevent this, each WhatsApp Business Account can only be connected once.</div>` +
+          `<p><strong>Solution:</strong> Use a different WhatsApp Business Account, or contact support if you believe this is an error.</p>` +
+          `</div></body></html>`
+        );
+      }
+    } catch (checkErr) {
+      console.error("[WhatsApp Connect] Failed to check existing connections:", checkErr.message);
+      // Don't block on error, but log it
+    }
+
+    // Log the connection attempt (after checks pass)
+    const attemptCount = logConnectionAttempt(businessId, waba_id);
+    console.log(
+      `[WhatsApp Connect] Connection attempt #${attemptCount} for biz ${businessId}, WABA ${waba_id || "unknown"}`
+    );
 
     try {
       await query(
@@ -333,6 +419,32 @@ router.get("/callback", async (req, res) => {
               .replace(/^whatsapp:/i, "")
               .replace(/^\+/, "")
               .replace(/\s+/g, "");
+
+            // ─── ANTI-FRAUD: Check if this WABA is already connected (code exchange path) ───
+            try {
+              const { rows: existingConnections } = await query(
+                `SELECT id FROM businesses
+                 WHERE whatsapp_business_account_id = $1 AND id != $2`,
+                [resolvedWabaId || null, businessId]
+              );
+
+              if (existingConnections.length > 0 && resolvedWabaId) {
+                console.error(
+                  `[WhatsApp Connect] WABA ${resolvedWabaId} already connected to another business (code exchange path). Blocking.`
+                );
+                return res.status(409).send(
+                  `This WhatsApp Business Account is already in use. Each account can only be connected once.`
+                );
+              }
+            } catch (checkErr) {
+              console.error("[WhatsApp Connect] Duplicate check failed (code path):", checkErr.message);
+            }
+
+            // Log the connection attempt
+            const attemptCount = logConnectionAttempt(businessId, resolvedWabaId);
+            console.log(
+              `[WhatsApp Connect] Code exchange connection attempt #${attemptCount} for biz ${businessId}`
+            );
 
             try {
               await query(
