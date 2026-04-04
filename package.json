@@ -25,11 +25,13 @@
     "cors": "^2.8.6",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "express-rate-limit": "^7.5.1",
     "jsonwebtoken": "^9.0.3",
     "node-cron": "^3.0.3",
     "pg": "^8.11.3",
     "razorpay": "^2.9.0",
-    "twilio": "^5.3.0"
+    "twilio": "^5.3.0",
+    "zod": "^3.25.76"
   },
   "license": "MIT",
   "devDependencies": {

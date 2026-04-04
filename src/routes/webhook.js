@@ -1,4 +1,5 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import {
   getSession, updateSession, resetSession, normalizePhone, STATES,
 } from '../services/session.service.js';
@@ -35,6 +36,14 @@ import { setCampaignOptOut } from '../services/messaging-preference.service.js';
 
 const router = express.Router();
 const DEFAULT_BUSINESS_ID = parseInt(process.env.DEFAULT_BUSINESS_ID || '1', 10);
+
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  message: { error: 'Too many webhook requests' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 const GLOBAL_REMINDER_TEMPLATE =
   process.env.WHATSAPP_REMINDER_TEMPLATE ||
   process.env.WHATSAPP_REMINDER_TEMPLATE_NAME || // backward compat
@@ -281,12 +290,14 @@ async function handleMessage({
   leadCampaign,
   leadUtmSource,
 }) {
-  console.log('[Webhook] Incoming message payload:', {
-    rawPhone,
-    explicitBusinessId,
-    toNumberForRouting,
-    preview: typeof message === 'string' ? message.slice(0, 120) : message,
-  });
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[Webhook] Incoming message payload:', {
+      rawPhone,
+      explicitBusinessId,
+      toNumberForRouting,
+      preview: typeof message === 'string' ? message.slice(0, 120) : message,
+    });
+  }
   const phone = normalizePhone(rawPhone);
 
   // Resolve business from explicitId, WhatsApp number, or fallback
@@ -564,7 +575,11 @@ async function handleMessage({
                       businessId,
                       GLOBAL_REMINDER_TEMPLATE_LANG,
                     );
-                    console.log(`[Reminder] 1-hour reminder sent to ${phone} (biz ${businessId})`);
+                    if (process.env.NODE_ENV !== 'production') {
+                      console.log(`[Reminder] 1-hour reminder sent to ${phone} (biz ${businessId})`);
+                    } else {
+                      console.log('[Reminder] 1-hour reminder sent');
+                    }
                   } catch (e) {
                     console.error(`[Reminder] 1-hour reminder failed for ${phone}:`, e.message);
                   }
@@ -1203,7 +1218,11 @@ async function handleMessage({
         if (wantsHuman) {
           await updateSession(phone, businessId, STATES.AWAITING_HANDOFF, {});
           reply = formatHandoffMessage(businessName);
-          console.log(`[Handoff] ${phone} (biz ${businessId}) requested a human agent`);
+          if (process.env.NODE_ENV !== 'production') {
+            console.log(`[Handoff] ${phone} (biz ${businessId}) requested a human agent`);
+          } else {
+            console.log('[Handoff] Human agent requested');
+          }
           break;
         }
 
@@ -1397,7 +1416,11 @@ async function handleMessage({
               service = services.find(s => s.id === lastSvc?.service_id)
                      || services.find(s => s.name.toLowerCase() === lastSvc?.service_name?.toLowerCase());
               if (service) {
-                console.log(`[Booking] ${phone} rebooking last service: ${service.name}`);
+                if (process.env.NODE_ENV !== 'production') {
+                  console.log(`[Booking] ${phone} rebooking last service: ${service.name}`);
+                } else {
+                  console.log(`[Booking] Rebooking last service: ${service.name}`);
+                }
               }
             }
           }
@@ -1638,7 +1661,11 @@ async function handleMessage({
                   // Fallback: no appointment reference; this is inside an active chat anyway.
                   await sendWhatsAppText(phone, reminderBody, businessId);
                 }
-                console.log(`[Reminder] Custom reminder sent to ${phone} (biz ${businessId}) at ${new Date().toISOString()}`);
+                if (process.env.NODE_ENV !== 'production') {
+                  console.log(`[Reminder] Custom reminder sent to ${phone} (biz ${businessId}) at ${new Date().toISOString()}`);
+                } else {
+                  console.log('[Reminder] Custom reminder sent');
+                }
               } catch (err) {
                 console.error(`[Reminder] Custom reminder failed for ${phone} (biz ${businessId}):`, err.message);
               }
@@ -1680,7 +1707,11 @@ async function handleMessage({
       }
     }
   } catch (err) {
-    console.error(`[Webhook] Error handling message from ${rawPhone} (biz ${explicitBusinessId}):`, err);
+    if (process.env.NODE_ENV !== 'production') {
+      console.error(`[Webhook] Error handling message from ${rawPhone} (biz ${explicitBusinessId}):`, err);
+    } else {
+      console.error('[Webhook] Error handling message');
+    }
     // Try lightweight recovery: if they asked for "my bookings", try to fulfill that
     const msgNorm = normForKeywords(messageForIntent);
     if (!/^cancel\s+/i.test(msgNorm) && CONTAINS_MY_BOOKINGS.test(messageForIntent || '')) {
@@ -1759,12 +1790,16 @@ function extractMetaMessageContent(msg) {
 }
 
 // ─── POST /webhook ─────────────────────────────────────────────────────────────
-router.post('/', async (req, res) => {
+router.post('/', webhookLimiter, async (req, res) => {
   // WhatsApp Cloud API payload
   if (Array.isArray(req.body.entry)) {
     let inboundWaId = null;
     try {
-      console.log('[Webhook] Incoming WhatsApp Cloud payload:', JSON.stringify(req.body, null, 2));
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[Webhook] Incoming WhatsApp Cloud payload:', JSON.stringify(req.body, null, 2));
+      } else {
+        console.log('[Webhook] Incoming WhatsApp Cloud message');
+      }
       const entry    = req.body.entry[0];
       const change   = entry?.changes?.[0];
       const value    = change?.value;
@@ -1855,7 +1890,11 @@ router.post('/', async (req, res) => {
       try {
         await sendWhatsAppText(rawPhone, reply || formatNotUnderstood(), businessIdForSend);
       } catch (sendErr) {
-        console.error(`[Webhook] Outbound send failed (biz ${businessIdForSend}):`, sendErr.message);
+        if (process.env.NODE_ENV !== 'production') {
+          console.error(`[Webhook] Outbound send failed (biz ${businessIdForSend}):`, sendErr.message);
+        } else {
+          console.error('[Webhook] Outbound send failed');
+        }
       }
       finishInboundWaDedupe(inboundWaId);
       return res.sendStatus(200);
@@ -1902,7 +1941,11 @@ router.post('/', async (req, res) => {
   const campaign = req.body.campaign || null;
   const utmSource = req.body.utmSource || null;
 
-  console.log('[Webhook] Incoming chat proxy payload:', { rawPhone, body, buttonText, businessId, toNumber });
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[Webhook] Incoming chat proxy payload:', { rawPhone, body, buttonText, businessId, toNumber });
+  } else {
+    console.log('[Webhook] Incoming chat proxy message');
+  }
 
   let reply;
   try {

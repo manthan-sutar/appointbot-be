@@ -1,52 +1,18 @@
 import express from "express";
 import { query } from "../config/db.js";
 import { requireAuth } from "../middleware/auth.js";
+import { recordAuditEvent } from "../services/audit.service.js";
+import { demoRequestSchema, formatZodError } from "../validation/schemas.js";
 
 const router = express.Router();
 
-const ALLOWED_BUSINESS_TYPES = new Set([
-  "salon",
-  "doctor",
-  "dentist",
-  "tutor",
-  "other",
-]);
-
-const EMAIL_RE =
-  /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
-
-function normalizeEmail(email) {
-  return String(email || "").trim().toLowerCase();
-}
-
 // ─── POST /api/demo/request (public) ───────────────────────────────────────────
 router.post("/request", async (req, res) => {
-  const business_name = String(req.body.business_name || "").trim();
-  const emailRaw = String(req.body.email || "").trim();
-  const phone = String(req.body.phone || "").trim();
-  const business_type = String(req.body.business_type || "").trim().toLowerCase();
-  const message =
-    req.body.message != null ? String(req.body.message).trim() || null : null;
-
-  if (!business_name) {
-    return res.status(400).json({ error: "Business name is required" });
+  const parsed = demoRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: formatZodError(parsed.error) });
   }
-  if (!emailRaw) {
-    return res.status(400).json({ error: "Email is required" });
-  }
-  const email = normalizeEmail(emailRaw);
-  if (!EMAIL_RE.test(email) || email.length > 255) {
-    return res.status(400).json({ error: "Please enter a valid email address" });
-  }
-  if (!phone) {
-    return res.status(400).json({ error: "Phone number is required" });
-  }
-  if (phone.length > 30) {
-    return res.status(400).json({ error: "Phone number is too long" });
-  }
-  if (!business_type || !ALLOWED_BUSINESS_TYPES.has(business_type)) {
-    return res.status(400).json({ error: "Please select a valid business type" });
-  }
+  const { business_name, email, phone, business_type, message } = parsed.data;
 
   try {
     const dup = await query(
@@ -65,6 +31,15 @@ router.post("/request", async (req, res) => {
        VALUES ($1, $2, $3, $4, $5)`,
       [business_name, email, phone, business_type, message],
     );
+
+    await recordAuditEvent({
+      action: "demo.request",
+      actorType: "anonymous",
+      resourceType: "demo_request",
+      ip: req.ip,
+      userAgent: req.get("user-agent") || null,
+      meta: { business_type },
+    });
 
     return res.status(201).json({
       success: true,

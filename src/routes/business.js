@@ -37,6 +37,7 @@ import {
 } from '../services/campaign-template.service.js';
 import { curateSlots } from '../utils/formatter.js';
 import { generateApiKey } from '../utils/apiKey.js';
+import { listAuditLogsForOwner } from '../services/audit.service.js';
 
 const router = express.Router();
 router.use(requireAuth);
@@ -555,6 +556,34 @@ router.get('/', async (req, res) => {
     res.json({ business: rows[0] });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load business' });
+  }
+});
+
+// ─── GET /api/business/audit-logs ─────────────────────────────────────────────
+// Security / account activity: logins, signups, and other events for this owner or business.
+router.get('/audit-logs', async (req, res) => {
+  try {
+    const ownerId = req.owner.ownerId;
+    const businessId = req.owner.businessId ?? null;
+    const limit = parseInt(req.query.limit, 10);
+    const offset = parseInt(req.query.offset, 10);
+
+    const result = await listAuditLogsForOwner({
+      businessId,
+      ownerId,
+      limit: Number.isFinite(limit) ? limit : 100,
+      offset: Number.isFinite(offset) ? offset : 0,
+    });
+
+    res.json({
+      logs: result.logs,
+      total: result.total,
+      limit: result.limit,
+      offset: result.offset,
+    });
+  } catch (err) {
+    console.error('[Business] audit-logs error:', err);
+    res.status(500).json({ error: 'Failed to load audit logs' });
   }
 });
 

@@ -44,12 +44,43 @@ const strictCors = cors({
 
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/widget")) {
-    return cors({ origin: true, credentials: false })(req, res, next);
+    return cors({
+      origin: true,
+      credentials: false,
+      methods: ["GET", "POST", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "X-Widget-API-Key"],
+    })(req, res, next);
   }
   return strictCors(req, res, next);
 });
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
+// Security headers (CSP relaxed enough for hosted chat + Google Fonts)
+app.use((req, res, next) => {
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains",
+    );
+  }
+  res.setHeader(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' data: https://fonts.gstatic.com",
+      "img-src 'self' data: https: blob:",
+      "connect-src 'self'",
+    ].join("; "),
+  );
+  next();
+});
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) =>

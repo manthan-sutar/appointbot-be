@@ -1,18 +1,33 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { requireAuth } from '../middleware/auth.js';
 import { getTodaysAppointments, getBusiness } from '../services/appointment.service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
-const DEFAULT_BUSINESS_ID = parseInt(process.env.DEFAULT_BUSINESS_ID || '1', 10);
 
-router.get('/', async (req, res) => {
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+router.get('/', requireAuth, async (req, res) => {
   try {
+    const businessId = req.owner.businessId;
+    if (!businessId) {
+      return res.status(400).json({ error: 'No business linked to your account' });
+    }
+
     const [appointments, business] = await Promise.all([
-      getTodaysAppointments(DEFAULT_BUSINESS_ID),
-      getBusiness(DEFAULT_BUSINESS_ID),
+      getTodaysAppointments(businessId),
+      getBusiness(businessId),
     ]);
+
+    const bizName = escapeHtml(business?.name || 'appointbot');
 
     const rows = appointments.map(a => {
       const time = new Date(a.scheduled_at).toLocaleTimeString('en-IN', {
@@ -21,13 +36,13 @@ router.get('/', async (req, res) => {
       const badgeClass = a.status === 'confirmed' ? 'badge-confirmed' : a.status === 'cancelled' ? 'badge-cancelled' : 'badge-completed';
       return `
         <tr>
-          <td class="cell-time">${time}</td>
-          <td>${a.service_name || '—'}</td>
-          <td>${a.staff_name || '—'}</td>
-          <td>${a.customer_name || '—'}</td>
-          <td class="cell-phone">${a.customer_phone}</td>
-          <td><span class="badge ${badgeClass}">${a.status}</span></td>
-          <td class="cell-ref">#${a.id}</td>
+          <td class="cell-time">${escapeHtml(time)}</td>
+          <td>${escapeHtml(a.service_name || '—')}</td>
+          <td>${escapeHtml(a.staff_name || '—')}</td>
+          <td>${escapeHtml(a.customer_name || '—')}</td>
+          <td class="cell-phone">${escapeHtml(a.customer_phone)}</td>
+          <td><span class="badge ${badgeClass}">${escapeHtml(a.status)}</span></td>
+          <td class="cell-ref">#${escapeHtml(String(a.id))}</td>
         </tr>`;
     }).join('');
 
@@ -40,7 +55,7 @@ router.get('/', async (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Admin — ${business?.name || 'appointbot'}</title>
+  <title>Admin — ${bizName}</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -163,9 +178,9 @@ router.get('/', async (req, res) => {
   <header>
     <div class="logo-wrap">
       <div class="logo-icon">📅</div>
-      <h1>${business?.name || 'appointbot'} — Admin</h1>
+      <h1>${bizName} — Admin</h1>
     </div>
-    <span class="header-date">${today}</span>
+    <span class="header-date">${escapeHtml(today)}</span>
   </header>
   <div class="container">
     <div class="meta">

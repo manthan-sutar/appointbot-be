@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import { query } from '../config/db.js';
 
+const isDev = process.env.NODE_ENV !== 'production';
+
 const GLOBAL_ACCESS_TOKEN    = process.env.WHATSAPP_ACCESS_TOKEN    || '';
 const GLOBAL_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || '';
 const GLOBAL_API_VERSION     = process.env.WHATSAPP_API_VERSION     || 'v21.0';
@@ -46,7 +48,11 @@ async function sendWithRetry(url, payload, headers, businessId, maxRetries = 1) 
       });
     } catch (networkErr) {
       if (attempt < maxRetries) {
-        console.warn(`[WhatsApp] Network error (biz ${businessId}), retrying in 2 s…`, networkErr.message);
+        if (isDev) {
+          console.warn(`[WhatsApp] Network error (biz ${businessId}), retrying in 2 s…`, networkErr.message);
+        } else {
+          console.warn('[WhatsApp] Network error, retrying…');
+        }
         await new Promise(r => setTimeout(r, 2000));
         continue;
       }
@@ -63,10 +69,14 @@ async function sendWithRetry(url, payload, headers, businessId, maxRetries = 1) 
     // Token expired / auth failure — log clearly and do not retry
     // Code 190 = "session invalid because user logged out" → token revoked or expired; re-auth needed
     if (res.status === 401 || code === 190 || code === 102) {
-      console.error(
-        `[WhatsApp] Auth error (biz ${businessId}) — access token invalid. Code: ${code}. ${errMsg}`,
-        '\n  → Fix: Get a new token (Meta Developer Console or re-run Connect WhatsApp in dashboard) and set WHATSAPP_ACCESS_TOKEN in .env or reconnect the business.',
-      );
+      if (isDev) {
+        console.error(
+          `[WhatsApp] Auth error (biz ${businessId}) — access token invalid. Code: ${code}. ${errMsg}`,
+          '\n  → Fix: Get a new token (Meta Developer Console or re-run Connect WhatsApp in dashboard) and set WHATSAPP_ACCESS_TOKEN in .env or reconnect the business.',
+        );
+      } else {
+        console.error('[WhatsApp] Authentication error. Check application logs and reconnect WhatsApp if needed.');
+      }
       throw new Error(`WhatsApp auth error: ${errMsg}`);
     }
 
@@ -75,36 +85,47 @@ async function sendWithRetry(url, payload, headers, businessId, maxRetries = 1) 
     // Code 131026 = "Message failed to send because more than 24 hours have passed since the customer last replied"
     // Code 131047 = Re-engagement message blocked (same root cause)
     if (code === 131026 || code === 131047) {
-      console.error(
-        `[WhatsApp] 24-hour window closed (biz ${businessId}) — freeform text rejected. Code: ${code}.`,
-        '\n  → Fix: Configure a WhatsApp utility message template and set WHATSAPP_REMINDER_TEMPLATE in .env',
-        '\n         or set whatsapp_reminder_template on the business record.',
-        '\n         See: https://business.whatsapp.com/products/platform-pricing',
-      );
+      if (isDev) {
+        console.error(
+          `[WhatsApp] 24-hour window closed (biz ${businessId}) — freeform text rejected. Code: ${code}.`,
+          '\n  → Fix: Configure a WhatsApp utility message template and set WHATSAPP_REMINDER_TEMPLATE in .env',
+          '\n         or set whatsapp_reminder_template on the business record.',
+        );
+      } else {
+        console.error('[WhatsApp] 24-hour messaging window closed for this recipient.');
+      }
       throw new Error(`WhatsApp window closed (131026): ${errMsg}`);
     }
 
     // Dev / test number list — Meta only allows a small whitelist until app is Live + WABA verified.
     // Code 131030 = "Recipient phone number not in allowed list"
     if (code === 131030) {
-      console.error(
-        `[WhatsApp] Recipient not on Meta allowlist (biz ${businessId}). Code: 131030. ${errMsg}`,
-        '\n  → Development: Meta Developer → Your App → WhatsApp → API Setup — add each recipient phone, verify OTP (limited test numbers).',
-        '\n  → Production: Publish the app (Live), complete Business Verification in Meta Business Manager,',
-        '\n     use approved Marketing/Utility templates for outbound bulk; recipients must use WhatsApp and opt-in.',
-        '\n  → See: appointbot-be/docs/WHATSAPP_CAMPAIGNS.md',
-      );
+      if (isDev) {
+        console.error(
+          `[WhatsApp] Recipient not on Meta allowlist (biz ${businessId}). Code: 131030. ${errMsg}`,
+        );
+      } else {
+        console.error('[WhatsApp] Recipient not allowed for this app mode (allowlist / verification).');
+      }
       throw new Error(`WhatsApp send failed: ${errMsg}`);
     }
 
     // Rate limit — do not retry
     if (res.status === 429) {
-      console.error(`[WhatsApp] Rate limited (biz ${businessId}). ${errMsg}`);
+      if (isDev) {
+        console.error(`[WhatsApp] Rate limited (biz ${businessId}). ${errMsg}`);
+      } else {
+        console.error('[WhatsApp] Rate limited.');
+      }
       throw new Error(`WhatsApp rate limit: ${errMsg}`);
     }
 
     if (attempt < maxRetries) {
-      console.warn(`[WhatsApp] Send failed (biz ${businessId}), HTTP ${res.status} — retrying in 2 s… ${errMsg}`);
+      if (isDev) {
+        console.warn(`[WhatsApp] Send failed (biz ${businessId}), HTTP ${res.status} — retrying in 2 s… ${errMsg}`);
+      } else {
+        console.warn(`[WhatsApp] Send failed, HTTP ${res.status} — retrying…`);
+      }
       await new Promise(r => setTimeout(r, 2000));
       continue;
     }
@@ -119,12 +140,16 @@ export async function sendWhatsAppText(to, body, businessId) {
   const { accessToken, phoneNumberId, apiVersion } = await getBusinessWhatsAppConfig(businessId);
 
   if (!accessToken || !phoneNumberId) {
-    console.warn('[WhatsApp] Cloud API not configured, skipping text send:', {
-      to,
-      businessId: businessId ?? 'global',
-      hasAccessToken: Boolean(accessToken),
-      hasPhoneNumberId: Boolean(phoneNumberId),
-    });
+    if (isDev) {
+      console.warn('[WhatsApp] Cloud API not configured, skipping text send:', {
+        to,
+        businessId: businessId ?? 'global',
+        hasAccessToken: Boolean(accessToken),
+        hasPhoneNumberId: Boolean(phoneNumberId),
+      });
+    } else {
+      console.warn('[WhatsApp] Cloud API not configured, skipping text send');
+    }
     return;
   }
 
@@ -138,11 +163,15 @@ export async function sendWhatsAppText(to, body, businessId) {
     text:  { body },
   };
 
-  console.log('[WhatsApp] Outgoing message:', {
-    to:          cleanTo,
-    businessId:  businessId ?? null,
-    bodyPreview: typeof body === 'string' ? body.slice(0, 80) : body,
-  });
+  if (isDev) {
+    console.log('[WhatsApp] Outgoing message:', {
+      to:          cleanTo,
+      businessId:  businessId ?? null,
+      bodyPreview: typeof body === 'string' ? body.slice(0, 80) : body,
+    });
+  } else {
+    console.log('[WhatsApp] Outgoing text message');
+  }
 
   await sendWithRetry(
     url,
@@ -162,13 +191,17 @@ export async function sendWhatsAppTemplate(to, templateName, bodyParams = [], bu
   const { accessToken, phoneNumberId, apiVersion } = await getBusinessWhatsAppConfig(businessId);
 
   if (!accessToken || !phoneNumberId) {
-    console.warn('[WhatsApp] Cloud API not configured, skipping template send:', {
-      to,
-      templateName,
-      businessId: businessId ?? 'global',
-      hasAccessToken: Boolean(accessToken),
-      hasPhoneNumberId: Boolean(phoneNumberId),
-    });
+    if (isDev) {
+      console.warn('[WhatsApp] Cloud API not configured, skipping template send:', {
+        to,
+        templateName,
+        businessId: businessId ?? 'global',
+        hasAccessToken: Boolean(accessToken),
+        hasPhoneNumberId: Boolean(phoneNumberId),
+      });
+    } else {
+      console.warn('[WhatsApp] Cloud API not configured, skipping template send');
+    }
     return;
   }
 
@@ -188,12 +221,16 @@ export async function sendWhatsAppTemplate(to, templateName, bodyParams = [], bu
     },
   };
 
-  console.log('[WhatsApp] Outgoing template:', {
-    to:           cleanTo,
-    businessId:   businessId ?? null,
-    template:     templateName,
-    paramsCount:  bodyParams.length,
-  });
+  if (isDev) {
+    console.log('[WhatsApp] Outgoing template:', {
+      to:           cleanTo,
+      businessId:   businessId ?? null,
+      template:     templateName,
+      paramsCount:  bodyParams.length,
+    });
+  } else {
+    console.log('[WhatsApp] Outgoing template message');
+  }
 
   await sendWithRetry(
     url,

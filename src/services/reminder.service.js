@@ -1,4 +1,6 @@
 import cron from 'node-cron';
+
+const isDev = process.env.NODE_ENV !== 'production';
 import {
   getAppointmentsDueFor24hReminder,
   getAppointmentsDueFor2hReminder,
@@ -54,9 +56,13 @@ async function sendReminder(appt) {
     GLOBAL_TEMPLATE_LANG,
   );
 
-  console.log(
-    `[Reminders] Template "${templateName}" sent for appt #${appt.id} to ${appt.customer_phone}`,
-  );
+  if (isDev) {
+    console.log(
+      `[Reminders] Template "${templateName}" sent for appt #${appt.id} to ${appt.customer_phone}`,
+    );
+  } else {
+    console.log(`[Reminders] Template "${templateName}" sent for appt #${appt.id}`);
+  }
 }
 
 async function sendTwoHourConfirmationReminder(appt) {

@@ -1,14 +1,34 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcrypt';
 import { query } from '../config/db.js';
 import { signToken, requireAuth } from '../middleware/auth.js';
+import { recordAuditEvent } from '../services/audit.service.js';
+import { loginBodySchema, signupBodySchema, formatZodError } from '../validation/schemas.js';
 
 const router = express.Router();
 const SALT_ROUNDS = 12;
 
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+});
+
+const signupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  message: { error: 'Too many signup attempts. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // ─── POST /api/auth/signup ────────────────────────────────────────────────────
 // Self-service signup is off unless ALLOW_PUBLIC_SIGNUP=true (e.g. local dev only).
-router.post('/signup', async (req, res) => {
+router.post('/signup', signupLimiter, async (req, res) => {
   if (process.env.ALLOW_PUBLIC_SIGNUP !== 'true') {
     return res.status(403).json({
       error:
@@ -16,14 +36,11 @@ router.post('/signup', async (req, res) => {
     });
   }
 
-  const { email, password } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+  const parsed = signupBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: formatZodError(parsed.error) });
   }
-  if (password.length < 8) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters' });
-  }
+  const { email, password } = parsed.data;
 
   try {
     const existing = await query('SELECT id FROM business_owners WHERE email = $1', [email.toLowerCase()]);
@@ -39,6 +56,16 @@ router.post('/signup', async (req, res) => {
     const owner = rows[0];
 
     const token = signToken({ ownerId: owner.id, businessId: null, email: owner.email });
+    await recordAuditEvent({
+      action: 'auth.signup',
+      actorType: 'owner',
+      actorId: owner.id,
+      businessId: null,
+      resourceType: 'business_owner',
+      resourceId: String(owner.id),
+      ip: req.ip,
+      userAgent: req.get('user-agent') || null,
+    });
     res.status(201).json({ token, owner: { id: owner.id, email: owner.email, onboarded: owner.onboarded } });
   } catch (err) {
     console.error('[Auth] Signup error:', err);
@@ -47,12 +74,12 @@ router.post('/signup', async (req, res) => {
 });
 
 // ─── POST /api/auth/login ─────────────────────────────────────────────────────
-router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+router.post('/login', loginLimiter, async (req, res) => {
+  const parsed = loginBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: formatZodError(parsed.error) });
   }
+  const { email, password } = parsed.data;
 
   try {
     const { rows } = await query(
@@ -73,6 +100,16 @@ router.post('/login', async (req, res) => {
     }
 
     const token = signToken({ ownerId: owner.id, businessId: owner.business_id, email: owner.email });
+    await recordAuditEvent({
+      action: 'auth.login',
+      actorType: 'owner',
+      actorId: owner.id,
+      businessId: owner.business_id || null,
+      resourceType: 'business_owner',
+      resourceId: String(owner.id),
+      ip: req.ip,
+      userAgent: req.get('user-agent') || null,
+    });
     res.json({
       token,
       owner: {

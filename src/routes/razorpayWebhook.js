@@ -115,6 +115,14 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
     return res.status(400).send('Invalid payload');
   }
 
+  const eventTimestamp = event.created_at != null ? Number(event.created_at) : NaN;
+  const now = Math.floor(Date.now() / 1000);
+  const MAX_AGE_SECONDS = 300;
+  if (!Number.isFinite(eventTimestamp) || Math.abs(now - eventTimestamp) > MAX_AGE_SECONDS) {
+    console.warn('[Razorpay] Webhook timestamp too old or missing');
+    return res.status(400).send('Invalid timestamp');
+  }
+
   try {
     if (event.entity && event.entity.entity === 'subscription') {
       await updateSubscriptionFromEvent(event);

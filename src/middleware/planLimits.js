@@ -50,6 +50,12 @@ export async function getServicesLimitInfo(businessId) {
 }
 
 async function countRows(table, businessId) {
+  // ⚠️ SECURITY: Whitelist allowed table names to prevent SQL injection
+  const ALLOWED_TABLES = new Set(['staff', 'services']);
+  if (!ALLOWED_TABLES.has(table)) {
+    throw new Error(`Invalid table name: ${table}`);
+  }
+
   const { rows } = await query(
     `SELECT COUNT(*) AS n FROM ${table} WHERE business_id = $1 AND active = TRUE`,
     [businessId]

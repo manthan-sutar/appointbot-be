@@ -17,6 +17,10 @@ const router = express.Router();
 
 const DEFAULT_BUSINESS_ID = parseInt(process.env.DEFAULT_BUSINESS_ID || '1', 10);
 
+function isValidChatSlug(slug) {
+  return typeof slug === 'string' && slug.length > 0 && slug.length <= 64 && /^[a-z0-9-]+$/.test(slug);
+}
+
 /**
  * Base URL to POST /webhook on this same Node process.
  * Do NOT use BACKEND_URL here — it often points at production (emails, widget embeds)
@@ -44,7 +48,12 @@ async function resolveBusiness(slug) {
 }
 
 // ─── GET /chat/:slug/widget.js — same self-contained bundle as GET /widget.js (legacy path)
-router.get('/:slug/widget.js', validateWidgetApiKey, serveWidgetScript);
+router.get('/:slug/widget.js', (req, res, next) => {
+  if (!isValidChatSlug(req.params.slug)) {
+    return res.status(400).type('application/javascript').send('// Invalid slug');
+  }
+  next();
+}, validateWidgetApiKey, serveWidgetScript);
 
 // ─── GET /chat — legacy root (redirects to default slug) ─────────────────────
 router.get('/', async (req, res) => {
@@ -55,15 +64,20 @@ router.get('/', async (req, res) => {
 
 // ─── GET /chat/:slug — per-tenant chat UI ────────────────────────────────────
 router.get('/:slug', async (req, res) => {
-  const biz = await resolveBusiness(req.params.slug);
+  const paramSlug = req.params.slug;
+  if (!isValidChatSlug(paramSlug)) {
+    return res.status(400).send('Invalid slug');
+  }
+  const biz = await resolveBusiness(paramSlug);
   if (!biz) return res.status(404).send('Business not found');
   const htmlPath = path.join(__dirname, '../../public/chat.html');
   let html = await fs.readFile(htmlPath, 'utf8');
+  const slug = biz.slug || paramSlug;
   const inject =
     '<script>window.__APPOINTBOT__=' +
     JSON.stringify({
       name: biz.name,
-      slug: biz.slug || req.params.slug,
+      slug,
     }) +
     '<\/script>';
   html = html.replace('</head>', `${inject}</head>`);
@@ -72,6 +86,9 @@ router.get('/:slug', async (req, res) => {
 
 // ─── POST /chat/:slug/send — proxy message to webhook ────────────────────────
 router.post('/:slug/send', async (req, res) => {
+  if (!isValidChatSlug(req.params.slug)) {
+    return res.status(400).json({ reply: 'Invalid slug' });
+  }
   const biz = await resolveBusiness(req.params.slug);
   if (!biz) return res.status(404).json({ reply: 'Business not found' });
 
@@ -171,6 +188,9 @@ router.post('/send', async (req, res) => {
 // ─── DELETE /chat/:slug/reset — reset test session ───────────────────────────
 router.delete('/:slug/reset', async (req, res) => {
   try {
+    if (!isValidChatSlug(req.params.slug)) {
+      return res.status(400).json({ ok: false });
+    }
     const biz = await resolveBusiness(req.params.slug);
     if (!biz) return res.status(404).json({ ok: false });
     await deleteSession(`test-${biz.slug || biz.id}`, biz.id);

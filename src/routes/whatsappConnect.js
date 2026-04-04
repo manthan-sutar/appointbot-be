@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "crypto";
 import "dotenv/config";
 import { query } from "../config/db.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -36,15 +37,48 @@ function checkTooManyAttempts(businessId) {
   return recentAttempts.length > MAX_ATTEMPTS_PER_WINDOW;
 }
 
-// ─── Helper: encode/decode state payload ───────────────────────────────────────
+// ─── Helper: encode/decode state payload (HMAC-signed) ─────────────────────────
+function oauthStateSecret() {
+  return process.env.OAUTH_STATE_SECRET || process.env.JWT_SECRET || "";
+}
+
 function encodeState(payload) {
-  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const secret = oauthStateSecret();
+  if (!secret) {
+    throw new Error("OAUTH_STATE_SECRET or JWT_SECRET is required for OAuth state signing");
+  }
+  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const hmac = crypto.createHmac("sha256", secret).update(encoded).digest("hex");
+  return `${encoded}.${hmac}`;
 }
 
 function decodeState(state) {
   try {
-    return JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
-  } catch {
+    const secret = oauthStateSecret();
+    if (!secret) return null;
+
+    const raw = String(state || "");
+    const dot = raw.indexOf(".");
+    if (dot < 0) return null;
+    const encoded = raw.slice(0, dot);
+    const hmac = raw.slice(dot + 1);
+    if (!encoded || !hmac) return null;
+
+    const expectedHex = crypto.createHmac("sha256", secret).update(encoded).digest("hex");
+    const a = Buffer.from(hmac, "utf8");
+    const b = Buffer.from(expectedHex, "utf8");
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      console.warn("[WhatsApp Connect] State HMAC validation failed");
+      return null;
+    }
+
+    return JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch (e) {
+    if (process.env.NODE_ENV !== "production") {
+      console.error("[WhatsApp Connect] State decode error:", e.message);
+    } else {
+      console.error("[WhatsApp Connect] State decode error");
+    }
     return null;
   }
 }

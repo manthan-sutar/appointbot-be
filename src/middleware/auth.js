@@ -1,6 +1,17 @@
 import jwt from 'jsonwebtoken';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'appointbot_jwt_secret_change_in_production';
+// ⚠️ SECURITY: JWT_SECRET must be a strong, unpredictable string
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error(
+    'FATAL: JWT_SECRET environment variable is required. Set a strong, random 32+ character string in .env'
+  );
+}
+if (JWT_SECRET.length < 32) {
+  throw new Error(
+    'FATAL: JWT_SECRET must be at least 32 characters long. Use a cryptographically random string.'
+  );
+}
 
 export function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -20,5 +31,5 @@ export function requireAuth(req, res, next) {
 }
 
 export function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 }

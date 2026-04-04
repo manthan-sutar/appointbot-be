@@ -10,6 +10,7 @@ import {
   DEFAULT_WEB_CHAT_WIDGET_SOURCE,
   LEAD_SOURCE,
 } from '../constants/leadSources.js';
+import { widgetChatBodySchema, formatZodError } from '../validation/schemas.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -63,7 +64,12 @@ const router = express.Router();
 
 router.post('/chat', validateWidgetApiKeyHeader, async (req, res) => {
   const biz = req.business;
-  const { message, source, campaign, utmSource } = req.body || {};
+  const parsed = widgetChatBodySchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    return res.status(400).json({ error: formatZodError(parsed.error) });
+  }
+  const { message, source, campaign, utmSource } = parsed.data;
+
   const resolvedSource = source || DEFAULT_WEB_CHAT_WIDGET_SOURCE;
   const testPhone = `test-${biz.slug || biz.id}`;
 
