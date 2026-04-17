@@ -140,6 +140,9 @@ ALTER TABLE businesses
   ADD COLUMN IF NOT EXISTS whatsapp_status          TEXT DEFAULT 'unverified',
   ADD COLUMN IF NOT EXISTS whatsapp_business_account_id TEXT;
 
+ALTER TABLE businesses
+  ADD COLUMN IF NOT EXISTS whatsapp_test_recipient_setup JSONB NOT NULL DEFAULT '{}'::jsonb;
+
 -- Reminder template: name of a Meta-approved "Utility" message template to use
 -- for appointment reminders. Required to reach customers outside the 24-hour
 -- conversation window. If NULL, falls back to freeform text (only works when
@@ -338,7 +341,11 @@ CREATE TABLE IF NOT EXISTS demo_requests (
   business_type VARCHAR(50) NOT NULL,
   message TEXT,
   status VARCHAR(50) NOT NULL DEFAULT 'new'
-    CHECK (status IN ('new', 'contacted', 'converted', 'rejected')),
+    CHECK (status IN ('new', 'invited', 'scheduled', 'demo_done', 'won', 'lost')),
+  assigned_to TEXT,
+  internal_notes TEXT,
+  next_followup_at TIMESTAMPTZ,
+  last_contacted_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -348,6 +355,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_demo_requests_email_lower
 
 CREATE INDEX IF NOT EXISTS idx_demo_requests_created
   ON demo_requests (created_at DESC);
+
+-- One-time magic links (demo sandbox login); token stored as SHA-256 hash only.
+CREATE TABLE IF NOT EXISTS magic_login_tokens (
+  id SERIAL PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  business_owner_id INTEGER NOT NULL REFERENCES business_owners(id) ON DELETE CASCADE,
+  demo_request_id INTEGER REFERENCES demo_requests(id) ON DELETE SET NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_magic_login_tokens_expires
+  ON magic_login_tokens (expires_at)
+  WHERE used_at IS NULL;
 
 -- Append-only audit log (auth events, future admin actions)
 CREATE TABLE IF NOT EXISTS audit_logs (

@@ -13,6 +13,7 @@
 - Only those test numbers can message the test WhatsApp number. Real random users cannot.
 - Use this to verify: Connect flow, webhook delivery, booking flow, and reminders for your test numbers.
 - **No app review needed** for this. You can test end-to-end with your own phones by adding them as test numbers.
+- **In-dashboard wizard:** Settings → WhatsApp includes a saved checklist and a deep link to Meta’s developer console. That does **not** call Graph API to register numbers (Meta has no public API for that); it guides users through the manual console steps.
 
 ### 2. Using a real WhatsApp Business number (still in dev)
 

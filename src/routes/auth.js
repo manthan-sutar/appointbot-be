@@ -4,10 +4,24 @@ import bcrypt from 'bcrypt';
 import { query } from '../config/db.js';
 import { signToken, requireAuth } from '../middleware/auth.js';
 import { recordAuditEvent } from '../services/audit.service.js';
-import { loginBodySchema, signupBodySchema, formatZodError } from '../validation/schemas.js';
+import {
+  loginBodySchema,
+  signupBodySchema,
+  magicLoginBodySchema,
+  formatZodError,
+} from '../validation/schemas.js';
+import { consumeMagicLoginToken } from '../services/magicLink.service.js';
 
 const router = express.Router();
 const SALT_ROUNDS = 12;
+
+const magicLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { error: 'Too many magic-link attempts. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -123,6 +137,60 @@ router.post('/login', loginLimiter, async (req, res) => {
   } catch (err) {
     console.error('[Auth] Login error:', err);
     res.status(500).json({ error: 'Login failed. Please try again.' });
+  }
+});
+
+// ─── POST /api/auth/magic-login (one-time demo link; no password) ─────────────
+router.post('/magic-login', magicLoginLimiter, async (req, res) => {
+  const parsed = magicLoginBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: formatZodError(parsed.error) });
+  }
+
+  try {
+    const result = await consumeMagicLoginToken(parsed.data.token);
+    if (result.error) {
+      const msg = {
+        invalid: 'This sign-in link is invalid.',
+        used: 'This link was already used. Request a new demo confirmation email.',
+        expired: 'This link has expired. Submit the demo form again for a new link.',
+      };
+      return res.status(401).json({
+        error: msg[result.error] || 'Invalid or expired link',
+        code: result.error,
+      });
+    }
+
+    const { owner } = result;
+
+    const token = signToken({
+      ownerId: owner.id,
+      businessId: owner.business_id,
+      email: owner.email,
+    });
+    await recordAuditEvent({
+      action: 'auth.magic_login',
+      actorType: 'owner',
+      actorId: owner.id,
+      businessId: owner.business_id || null,
+      resourceType: 'business_owner',
+      resourceId: String(owner.id),
+      ip: req.ip,
+      userAgent: req.get('user-agent') || null,
+    });
+    return res.json({
+      token,
+      owner: {
+        id: owner.id,
+        email: owner.email,
+        businessId: owner.business_id,
+        onboarded: owner.onboarded,
+        slug: owner.slug,
+      },
+    });
+  } catch (err) {
+    console.error('[Auth] magic-login error:', err);
+    return res.status(500).json({ error: 'Could not sign you in. Try again later.' });
   }
 });
 

@@ -67,9 +67,43 @@ export const demoRequestSchema = z
         : null,
   }));
 
+const demoRequestStatuses = [
+  "new",
+  "invited",
+  "scheduled",
+  "demo_done",
+  "won",
+  "lost",
+];
+
+export const demoRequestUpdateSchema = z.object({
+  status: z.enum(demoRequestStatuses).optional(),
+  assigned_to: z.union([z.string().trim().max(255), z.null()]).optional(),
+  internal_notes: z.union([z.string().trim().max(5000), z.null()]).optional(),
+  next_followup_at: z.union([z.string().datetime(), z.null()]).optional(),
+  last_contacted_at: z.union([z.string().datetime(), z.null()]).optional(),
+});
+
 export const widgetChatBodySchema = z.object({
   message: z.string().min(1).max(5000),
   source: z.string().max(100).optional(),
   campaign: z.string().max(100).optional(),
   utmSource: z.string().max(100).optional(),
+});
+
+/** Merge fields for GET /api/business/whatsapp-test-recipient-setup PUT */
+export const whatsappTestRecipientSetupPutSchema = z.object({
+  phone: z.union([z.string().max(32), z.null()]).optional(),
+  steps: z
+    .object({
+      openedConsole: z.boolean().optional(),
+      addedNumber: z.boolean().optional(),
+      verifiedOtp: z.boolean().optional(),
+      sentTestMessage: z.boolean().optional(),
+    })
+    .optional(),
+});
+
+export const magicLoginBodySchema = z.object({
+  token: z.string().min(20).max(512),
 });

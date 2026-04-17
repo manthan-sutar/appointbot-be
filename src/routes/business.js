@@ -38,6 +38,10 @@ import {
 import { curateSlots } from '../utils/formatter.js';
 import { generateApiKey } from '../utils/apiKey.js';
 import { listAuditLogsForOwner } from '../services/audit.service.js';
+import {
+  formatZodError,
+  whatsappTestRecipientSetupPutSchema,
+} from '../validation/schemas.js';
 
 const router = express.Router();
 router.use(requireAuth);
@@ -53,6 +57,55 @@ function normalizePhone(phone) {
     .replace(/^\+/, '')
     .replace(/\s+/g, '')
     .trim();
+}
+
+/** Deep link for Settings → add Meta WhatsApp test recipients (override for region / path changes). */
+function metaWhatsAppDeveloperConsoleUrl() {
+  const override = process.env.WHATSAPP_META_CONSOLE_URL;
+  if (override != null && String(override).trim()) return String(override).trim();
+  const appId = process.env.WHATSAPP_APP_ID;
+  if (!appId) return null;
+  return `https://developers.facebook.com/apps/${encodeURIComponent(appId)}/whatsapp-business/wa-dev-console/`;
+}
+
+const WA_TEST_STEP_KEYS = ['openedConsole', 'addedNumber', 'verifiedOtp', 'sentTestMessage'];
+
+function normalizeWaTestRecipientSetup(raw) {
+  const o = raw && typeof raw === 'object' ? raw : {};
+  const steps = {};
+  for (const k of WA_TEST_STEP_KEYS) {
+    steps[k] = typeof o.steps?.[k] === 'boolean' ? o.steps[k] : false;
+  }
+  let phone = null;
+  if (typeof o.phone === 'string' && o.phone.trim()) {
+    const cleaned = normalizePhone(o.phone).slice(0, 24);
+    phone = cleaned || null;
+  }
+  const updatedAt = typeof o.updatedAt === 'string' ? o.updatedAt : null;
+  return { phone, steps, updatedAt };
+}
+
+function mergeWaTestRecipientSetup(prevRaw, incoming) {
+  const prev = normalizeWaTestRecipientSetup(prevRaw);
+  const next = {
+    phone: prev.phone,
+    steps: { ...prev.steps },
+    updatedAt: new Date().toISOString(),
+  };
+  if (incoming.phone !== undefined) {
+    if (incoming.phone == null || String(incoming.phone).trim() === '') {
+      next.phone = null;
+    } else {
+      const cleaned = normalizePhone(incoming.phone).slice(0, 24);
+      next.phone = cleaned || null;
+    }
+  }
+  if (incoming.steps) {
+    for (const k of WA_TEST_STEP_KEYS) {
+      if (typeof incoming.steps[k] === 'boolean') next.steps[k] = incoming.steps[k];
+    }
+  }
+  return next;
 }
 
 /** Booking counts for a business using its IANA timezone (not server-local dates). */
@@ -1708,7 +1761,8 @@ router.get('/whatsapp', async (req, res) => {
          whatsapp_display_phone,
          whatsapp_api_version,
          whatsapp_status,
-         (whatsapp_access_token IS NOT NULL) AS has_access_token
+         (whatsapp_access_token IS NOT NULL) AS has_access_token,
+         whatsapp_test_recipient_setup
        FROM businesses
        WHERE id = $1`,
       [req.owner.businessId]
@@ -1723,11 +1777,44 @@ router.get('/whatsapp', async (req, res) => {
         apiVersion: row.whatsapp_api_version || 'v21.0',
         status: row.whatsapp_status || 'unverified',
         hasAccessToken: !!row.has_access_token,
+        testRecipientSetup: normalizeWaTestRecipientSetup(row.whatsapp_test_recipient_setup),
+      },
+      metaDeveloper: {
+        whatsappConsoleUrl: metaWhatsAppDeveloperConsoleUrl(),
       },
     });
   } catch (err) {
     console.error('[Business] Load WhatsApp config error:', err.message);
     return res.status(500).json({ error: 'Failed to load WhatsApp settings' });
+  }
+});
+
+// ─── PUT /api/business/whatsapp-test-recipient-setup ─────────────────────────
+router.put('/whatsapp-test-recipient-setup', async (req, res) => {
+  const parsed = whatsappTestRecipientSetupPutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: formatZodError(parsed.error) });
+  }
+  try {
+    const { rows } = await query(
+      `SELECT whatsapp_test_recipient_setup FROM businesses WHERE id = $1`,
+      [req.owner.businessId],
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Business not found' });
+    const merged = mergeWaTestRecipientSetup(rows[0].whatsapp_test_recipient_setup, parsed.data);
+    await query(
+      `UPDATE businesses SET whatsapp_test_recipient_setup = $2::jsonb WHERE id = $1`,
+      [req.owner.businessId, JSON.stringify(merged)],
+    );
+    return res.json({
+      testRecipientSetup: merged,
+      metaDeveloper: {
+        whatsappConsoleUrl: metaWhatsAppDeveloperConsoleUrl(),
+      },
+    });
+  } catch (err) {
+    console.error('[Business] whatsapp-test-recipient-setup error:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to save test recipient checklist' });
   }
 });
 

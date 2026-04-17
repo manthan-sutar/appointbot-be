@@ -18,7 +18,12 @@
     "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
     "test:manual": "node __tests__/manual-test.js",
     "test:quick": "node __tests__/quick-test.js",
-    "test:report": "node __tests__/report.js"
+    "test:report": "node __tests__/report.js",
+    "test:resend": "node scripts/test-resend.mjs",
+    "sandbox:ensure": "node scripts/ensure-sandbox-owner.mjs",
+    "sandbox:profile": "node scripts/sandbox-profile.mjs",
+    "sandbox:cleanup": "node scripts/cleanup-non-sandbox-tenants.mjs",
+    "demo:clear": "node scripts/cleanup-demo-requests.mjs"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
@@ -30,6 +35,7 @@
     "node-cron": "^3.0.3",
     "pg": "^8.11.3",
     "razorpay": "^2.9.0",
+    "resend": "^4.8.0",
     "twilio": "^5.3.0",
     "zod": "^3.25.76"
   },
