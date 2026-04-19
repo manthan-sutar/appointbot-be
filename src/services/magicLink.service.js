@@ -20,7 +20,8 @@ export function buildMagicLoginUrl(rawToken) {
 }
 
 /**
- * Create a one-time link for the configured demo sandbox owner.
+ * Create a one-time token for the configured demo sandbox owner (`POST /api/auth/magic-login` consumes it).
+ * The public demo form does not call this (policy); re-wire from `routes/demo.js` if you want auto links in demo emails again.
  * @returns {Promise<string|null>} raw secret token, or null if demo owner not configured / missing row
  */
 let warnedMissingDemoOwnerEnv;
@@ -31,7 +32,7 @@ export async function createMagicLoginTokenForDemoRequest(demoRequestId) {
     if (!warnedMissingDemoOwnerEnv) {
       warnedMissingDemoOwnerEnv = true;
       console.warn(
-        "[MagicLink] DEMO_SANDBOX_OWNER_ID is not set — demo emails will not include a magic link. Set it on this server (e.g. Render) to match your sandbox owner row.",
+        "[MagicLink] DEMO_SANDBOX_OWNER_ID is not set — createMagicLoginTokenForDemoRequest returns null. Set it to a valid business_owners.id for sandbox tokens (e.g. Render).",
       );
     }
     return null;

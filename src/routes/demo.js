@@ -8,12 +8,11 @@ import {
   formatZodError,
 } from "../validation/schemas.js";
 import { sendDemoRequestEmails } from "../services/email.service.js";
-import {
-  buildMagicLoginUrl,
-  createMagicLoginTokenForDemoRequest,
-} from "../services/magicLink.service.js";
 
 const router = express.Router();
+
+/** Demo requests do not mint magic-login tokens (no auto sandbox access). Magic link code stays in
+ *  `magicLink.service.js` + `POST /api/auth/magic-login` for other flows or future use. */
 
 // ─── POST /api/demo/request (public) ───────────────────────────────────────────
 router.post("/request", async (req, res) => {
@@ -53,31 +52,12 @@ router.post("/request", async (req, res) => {
       meta: { business_type, demo_request_id: demoRequestId },
     });
 
-    let magicLinkUrl = null;
-    try {
-      const raw = await createMagicLoginTokenForDemoRequest(demoRequestId);
-      if (raw) magicLinkUrl = buildMagicLoginUrl(raw);
-    } catch (e) {
-      console.error("[Demo] magic link:", e?.message || e);
-    }
-    if (!magicLinkUrl) {
-      const hasOwner = Boolean(
-        String(process.env.DEMO_SANDBOX_OWNER_ID || "").trim(),
-      );
-      console.warn(
-        hasOwner
-          ? "[Demo] Magic link not included: token insert failed or owner missing in DB (run migrations: db/patches/magic_login_tokens.sql)."
-          : "[Demo] Magic link not included: set DEMO_SANDBOX_OWNER_ID on this server (and MAGIC_LINK_PUBLIC_URL / FRONTEND_URL for the correct link host).",
-      );
-    }
-
     void sendDemoRequestEmails({
       businessName: business_name,
       email,
       phone,
       businessType: business_type,
       message,
-      magicLinkUrl,
     }).catch((e) =>
       console.error("[Demo] sendDemoRequestEmails:", e?.message || e),
     );
