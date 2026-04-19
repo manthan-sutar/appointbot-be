@@ -1970,10 +1970,11 @@ export async function handleMessage({
       }
     }
   } catch (err) {
+    const errMsg = err?.message || String(err);
     if (process.env.NODE_ENV !== 'production') {
       console.error(`[Webhook] Error handling message from ${rawPhone} (biz ${explicitBusinessId}):`, err);
     } else {
-      console.error('[Webhook] Error handling message');
+      console.error('[Webhook] Error handling message:', errMsg);
     }
     // Try lightweight recovery: if they asked for "my bookings", try to fulfill that
     const msgNorm = normForKeywords(messageForIntent);

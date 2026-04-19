@@ -1,5 +1,8 @@
 import { query, getClient } from "../config/db.js";
 
+/** Log once if DB has no calendar exceptions table (migration not applied). */
+let warnedCalendarTableMissing = false;
+
 export async function createAppointmentEvent(appointmentId, businessId, eventType, eventData = {}) {
   if (!appointmentId || !businessId || !eventType) return;
   await query(
@@ -175,13 +178,33 @@ export async function getAvailableSlots(
   const todayInTz = new Date().toLocaleDateString("en-CA", { timeZone: tz });
   if (date < todayInTz) return [];
 
-  const { rows: excRows } = await query(
-    `SELECT closed, open_start, open_end
-       FROM business_calendar_exceptions
-      WHERE business_id = $1 AND exception_date = $2::date`,
-    [businessId, date],
-  );
-  const ex = excRows[0];
+  let ex = null;
+  try {
+    const { rows: excRows } = await query(
+      `SELECT closed, open_start, open_end
+         FROM business_calendar_exceptions
+        WHERE business_id = $1 AND exception_date = $2::date`,
+      [businessId, date],
+    );
+    ex = excRows[0];
+  } catch (e) {
+    const code = e?.code;
+    const msg = String(e?.message || "");
+    const missing =
+      code === "42P01" ||
+      msg.includes("business_calendar_exceptions") ||
+      msg.includes("does not exist");
+    if (missing) {
+      if (!warnedCalendarTableMissing) {
+        warnedCalendarTableMissing = true;
+        console.warn(
+          "[Appointment] business_calendar_exceptions missing — run db/migrations/001_business_calendar_exceptions.sql. Continuing without per-day exceptions.",
+        );
+      }
+    } else {
+      throw e;
+    }
+  }
   if (ex?.closed) return [];
 
   const dayOfWeek = new Date(date + "T12:00:00").getDay(); // 0=Sun, 6=Sat
