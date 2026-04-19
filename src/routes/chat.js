@@ -11,6 +11,7 @@ import {
   DEFAULT_WEB_CHAT_PAGE_SOURCE,
   LEAD_SOURCE,
 } from '../constants/leadSources.js';
+import { internalWebhookBaseUrl } from '../utils/publicBackendUrl.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -19,23 +20,6 @@ const DEFAULT_BUSINESS_ID = parseInt(process.env.DEFAULT_BUSINESS_ID || '1', 10)
 
 function isValidChatSlug(slug) {
   return typeof slug === 'string' && slug.length > 0 && slug.length <= 64 && /^[a-z0-9-]+$/.test(slug);
-}
-
-/**
- * Base URL to POST /webhook on this same Node process.
- * Do NOT use BACKEND_URL here — it often points at production (emails, widget embeds)
- * while you are running locally; that breaks the chat proxy with timeouts / wrong DB.
- */
-function webhookBaseUrl(req) {
-  const host = req?.get?.("host");
-  if (host) {
-    const proto = req.protocol || "http";
-    return `${proto}://${host}`.replace(/\/$/, "");
-  }
-  const port = process.env.PORT || 3000;
-  const fallback =
-    process.env.INTERNAL_WEBHOOK_BASE_URL || `http://127.0.0.1:${port}`;
-  return String(fallback).replace(/\/$/, "");
 }
 
 // ─── Helper: resolve business from slug or fallback ───────────────────────────
@@ -117,7 +101,7 @@ router.post('/:slug/send', async (req, res) => {
       });
     }
 
-    const response = await fetch(`${webhookBaseUrl(req)}/webhook`, {
+    const response = await fetch(`${internalWebhookBaseUrl(req)}/webhook`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -166,7 +150,7 @@ router.post('/send', async (req, res) => {
       });
     }
 
-    const response = await fetch(`${webhookBaseUrl(req)}/webhook`, {
+    const response = await fetch(`${internalWebhookBaseUrl(req)}/webhook`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

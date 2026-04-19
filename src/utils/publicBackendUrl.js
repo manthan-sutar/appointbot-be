@@ -62,3 +62,28 @@ export function getPublicBackendUrlForWidget(req) {
   const port = process.env.PORT || 3000;
   return `http://127.0.0.1:${port}`;
 }
+
+/**
+ * Base URL for server-side `fetch` to this process's `/webhook` (chat proxy, widget API).
+ * When the browser uses the Vite dev server (`Host: localhost:5173`), `http://localhost:5173/webhook`
+ * does not hit Express unless Vite proxies `/webhook`. Always call loopback to this Node server instead.
+ *
+ * @param {import('express').Request | undefined} req
+ */
+export function internalWebhookBaseUrl(req) {
+  const host = req?.get?.('host') || '';
+  const portFromHost = host.match(/:(\d+)$/);
+  const p = portFromHost ? Number(portFromHost[1]) : null;
+  if (p === 5173 || p === 5175) {
+    const port = process.env.PORT || 3000;
+    return `http://127.0.0.1:${port}`;
+  }
+  if (host) {
+    const proto = req.protocol || 'http';
+    return `${proto}://${host}`.replace(/\/$/, '');
+  }
+  const port = process.env.PORT || 3000;
+  return stripTrailingSlash(
+    process.env.INTERNAL_WEBHOOK_BASE_URL || `http://127.0.0.1:${port}`,
+  );
+}

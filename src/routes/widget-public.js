@@ -5,7 +5,10 @@ import { fileURLToPath } from 'url';
 import { deleteSession } from '../services/session.service.js';
 import { upsertLeadActivity, trackLeadEvent } from '../services/lead.service.js';
 import { validateWidgetApiKeyHeader } from '../middleware/widgetAuth.js';
-import { getPublicBackendUrlForWidget } from '../utils/publicBackendUrl.js';
+import {
+  getPublicBackendUrlForWidget,
+  internalWebhookBaseUrl,
+} from '../utils/publicBackendUrl.js';
 import {
   DEFAULT_WEB_CHAT_WIDGET_SOURCE,
   LEAD_SOURCE,
@@ -13,16 +16,6 @@ import {
 import { widgetChatBodySchema, formatZodError } from '../validation/schemas.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-function webhookBaseUrl(req) {
-  const host = req?.get?.('host');
-  if (host) {
-    const proto = req.protocol || 'http';
-    return `${proto}://${host}`.replace(/\/$/, '');
-  }
-  const port = process.env.PORT || 3000;
-  return (process.env.INTERNAL_WEBHOOK_BASE_URL || `http://127.0.0.1:${port}`).replace(/\/$/, '');
-}
 
 /**
  * GET /widget.js?api_key= — returns self-contained script (same UI as /chat/:slug, no iframe).
@@ -94,7 +87,7 @@ router.post('/chat', validateWidgetApiKeyHeader, async (req, res) => {
       });
     }
 
-    const response = await fetch(`${webhookBaseUrl(req)}/webhook`, {
+    const response = await fetch(`${internalWebhookBaseUrl(req)}/webhook`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

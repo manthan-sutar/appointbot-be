@@ -149,6 +149,15 @@ export async function getStaff(businessId) {
   return rows;
 }
 
+/** Parse Postgres TIME / "HH:MM" / "HH:MM:SS" to minutes from midnight. */
+function timeStrToMinutes(t) {
+  if (t == null || t === "") return null;
+  const parts = String(t).split(":").map(Number);
+  const h = parts[0] || 0;
+  const m = parts[1] || 0;
+  return h * 60 + m;
+}
+
 // ─── Get available time slots for a given date + staff + service ──────────────
 // Returns array of "HH:MM" strings that are free (never returns past slots).
 // Uses business timezone for "today" and for filtering booked appointments.
@@ -165,6 +174,15 @@ export async function getAvailableSlots(
 
   const todayInTz = new Date().toLocaleDateString("en-CA", { timeZone: tz });
   if (date < todayInTz) return [];
+
+  const { rows: excRows } = await query(
+    `SELECT closed, open_start, open_end
+       FROM business_calendar_exceptions
+      WHERE business_id = $1 AND exception_date = $2::date`,
+    [businessId, date],
+  );
+  const ex = excRows[0];
+  if (ex?.closed) return [];
 
   const dayOfWeek = new Date(date + "T12:00:00").getDay(); // 0=Sun, 6=Sat
 
@@ -203,8 +221,18 @@ export async function getAvailableSlots(
 
   const [sh, sm] = start_time.split(":").map(Number);
   const [eh, em] = end_time.split(":").map(Number);
-  const startMin = sh * 60 + sm;
-  const endMin = eh * 60 + em;
+  let startMin = sh * 60 + sm;
+  let endMin = eh * 60 + em;
+
+  if (ex && !ex.closed && ex.open_start != null && ex.open_end != null) {
+    const bizStart = timeStrToMinutes(ex.open_start);
+    const bizEnd = timeStrToMinutes(ex.open_end);
+    if (bizStart != null && bizEnd != null) {
+      startMin = Math.max(startMin, bizStart);
+      endMin = Math.min(endMin, bizEnd);
+    }
+  }
+  if (startMin >= endMin) return [];
 
   let nowMinutes = 0;
   if (date === todayInTz) {
@@ -687,7 +715,11 @@ export async function getTodaysAppointments(businessId) {
 // Scans the next `daysAhead` days and returns the soonest slot within ±toleranceMin
 // of the requested time. Used to proactively suggest "How about Wednesday at 5 PM?"
 function _timeToMinutes(t) {
+  if (t == null || typeof t !== "string" || !/^\d{1,2}:\d{2}$/.test(t.trim())) {
+    return NaN;
+  }
   const [h, m] = t.split(":").map(Number);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return NaN;
   return h * 60 + m;
 }
 
@@ -700,6 +732,7 @@ export async function findNextSlotNearTime(
   { daysAhead = 7, toleranceMin = 120 } = {},
 ) {
   const prefMin = _timeToMinutes(preferredTime);
+  if (!Number.isFinite(prefMin)) return null;
 
   for (let i = 1; i <= daysAhead; i++) {
     const d = new Date();

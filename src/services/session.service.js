@@ -89,13 +89,17 @@ export async function getSession(phone, businessId) {
   };
 }
 
+function jsonForSessionTemp(obj) {
+  return JSON.stringify(obj, (_, v) => (typeof v === 'bigint' ? Number(v) : v));
+}
+
 // ─── Update session state + temp_data ────────────────────────────────────────
 export async function updateSession(phone, businessId, state, temp = {}) {
   await query(
     `UPDATE sessions
      SET state = $1, temp_data = $2, updated_at = NOW()
      WHERE phone = $3 AND business_id = $4`,
-    [state, JSON.stringify(temp), phone, businessId],
+    [state, jsonForSessionTemp(temp), phone, businessId],
   );
 }
 

@@ -1,9 +1,24 @@
 import 'dotenv/config';
 
-const GROQ_API_KEY  = process.env.GROQ_API_KEY;
-const GROQ_MODEL    = process.env.GROQ_MODEL    || 'llama-3.3-70b-versatile';
-const OLLAMA_URL    = process.env.OLLAMA_URL    || 'http://localhost:11434';
-const OLLAMA_MODEL  = process.env.OLLAMA_MODEL  || 'llama3';
+import { callLLM, isLlmDegraded } from './llmClient.js';
+import {
+  classifyMessageDegraded,
+  extractBookingIntentDegraded,
+  extractRescheduleIntentDegraded,
+  extractAvailabilityQueryDegraded,
+  extractGlobalIntentDegraded,
+  DEGRADED_CONVERSATIONAL_FALLBACK,
+  DEGRADED_NUDGE_FALLBACK,
+  DEGRADED_FALLBACK_REPLY,
+  generateHelpReplyDegraded,
+  generateReturningUserGreetingDegraded,
+} from './aiDegraded.js';
+import {
+  parseBookingIntent as validateBookingIntent,
+  parseClassifyMessage,
+  parseRescheduleIntent as validateRescheduleIntent,
+  parseAvailabilityQuery as validateAvailabilityQuery,
+} from '../validation/aiOutput.js';
 
 const WHATSAPP_RECEPTIONIST_SYSTEM_PROMPT = `
 You are a human receptionist texting on WhatsApp for an appointment booking business.
@@ -23,42 +38,6 @@ Formatting:
 - Prefer short lines.
 - If you need to give options, put each option on its own line.
 `.trim();
-
-// ─── LLM router ──────────────────────────────────────────────────────────────
-
-async function callLLM(prompt, { temperature = 0, systemPrompt = null } = {}) {
-  if (GROQ_API_KEY) {
-    const messages = systemPrompt
-      ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
-      : [{ role: 'user', content: prompt }];
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages,
-        temperature,
-      }),
-    });
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || '';
-  }
-
-  // Ollama fallback
-  const fullPrompt = systemPrompt
-    ? `SYSTEM:\n${systemPrompt}\n\nUSER:\n${prompt}`.trim()
-    : prompt;
-  const res = await fetch(`${OLLAMA_URL}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: OLLAMA_MODEL, prompt: fullPrompt, stream: false }),
-  });
-  const data = await res.json();
-  return data.response || '';
-}
 
 // ─── JSON parser (same bracket-counting approach as sparebot) ─────────────────
 
@@ -129,6 +108,10 @@ function getNextWeekDatesInTZ(tz = 'Asia/Kolkata') {
 // Returns: { service, date, time, staffName } — all optional / null
 
 export async function extractBookingIntent(message, serviceList = [], tz = 'Asia/Kolkata') {
+  if (isLlmDegraded()) {
+    return extractBookingIntentDegraded(message, serviceList, tz);
+  }
+
   const today    = getTodayInTZ(tz);
   const tomorrow = getTomorrowInTZ(tz);
   const nextWeek = getNextWeekDatesInTZ(tz);
@@ -181,7 +164,7 @@ Example output: {"service":"haircut","date":"${tomorrow}","time":"17:00","staffN
   try {
     const raw = await callLLM(prompt);
     const result = parseJSON(raw);
-    return result || { service: null, date: null, time: null, staffName: null };
+    return validateBookingIntent(result, { today });
   } catch {
     return { service: null, date: null, time: null, staffName: null };
   }
@@ -191,6 +174,10 @@ Example output: {"service":"haircut","date":"${tomorrow}","time":"17:00","staffN
 // Returns: { date, time } — the new desired date/time
 
 export async function extractRescheduleIntent(message, tz = 'Asia/Kolkata') {
+  if (isLlmDegraded()) {
+    return extractRescheduleIntentDegraded(message, tz);
+  }
+
   const today    = getTodayInTZ(tz);
   const tomorrow = getTomorrowInTZ(tz);
   const nextWeek = getNextWeekDatesInTZ(tz);
@@ -221,7 +208,7 @@ Example: {"date":"${tomorrow}","time":"15:00"}
   try {
     const raw = await callLLM(prompt);
     const result = parseJSON(raw);
-    return result || { date: null, time: null };
+    return validateRescheduleIntent(result, { today });
   } catch {
     return { date: null, time: null };
   }
@@ -231,6 +218,10 @@ Example: {"date":"${tomorrow}","time":"15:00"}
 // Returns: { date } or { weekStart, weekEnd } for "this week" queries
 
 export async function extractAvailabilityQuery(message, tz = 'Asia/Kolkata') {
+  if (isLlmDegraded()) {
+    return extractAvailabilityQueryDegraded(tz);
+  }
+
   const today = getTodayInTZ(tz);
   const nextWeek = getNextWeekDatesInTZ(tz);
   // "this week" = today through next 6 days
@@ -258,7 +249,7 @@ Return ONLY the JSON object.
   try {
     const raw = await callLLM(prompt);
     const result = parseJSON(raw);
-    return result || { type: 'week', weekStart: today, weekEnd: weekEndStr };
+    return validateAvailabilityQuery(result, { today, weekEnd: weekEndStr });
   } catch {
     return { type: 'week', weekStart: today, weekEnd: weekEndStr };
   }
@@ -271,13 +262,14 @@ Return ONLY the JSON object.
 // Fast regex shortcuts that skip the LLM entirely for obvious cases.
 const HANDOFF_REGEX_FAST = /\b(human|person|agent|manager|owner|reception|real person|live (chat|support)|talk to (a |someone)|speak (to|with) (a |someone)|need help urgently)\b/i;
 
-const VALID_INTENTS = ['book', 'cancel', 'reschedule', 'repeat_booking', 'reminder', 'my_appointments',
-  'availability', 'help', 'contact', 'faq', 'none'];
-
 export async function classifyMessage(message, serviceNames = []) {
   // Fast-path: clear handoff request → skip LLM
   if (HANDOFF_REGEX_FAST.test(message)) {
     return { handoff: true, intent: 'none' };
+  }
+
+  if (isLlmDegraded()) {
+    return classifyMessageDegraded(message, serviceNames);
   }
 
   const servicesHint = serviceNames.length
@@ -316,11 +308,7 @@ Return ONLY valid JSON. Example: {"handoff":false,"intent":"book"}
   try {
     const raw = await callLLM(prompt, { temperature: 0 });
     const parsed = parseJSON(raw);
-    const intent = parsed?.intent?.toLowerCase().replace(/[^a-z_]/g, '') || 'none';
-    return {
-      handoff: Boolean(parsed?.handoff),
-      intent: VALID_INTENTS.includes(intent) ? intent : 'none',
-    };
+    return parseClassifyMessage(parsed || {});
   } catch (err) {
     console.error('[AI] classifyMessage failed:', err.message);
     return { handoff: false, intent: 'none' };
@@ -332,6 +320,10 @@ Return ONLY valid JSON. Example: {"handoff":false,"intent":"book"}
 //                 "availability", "help", "contact", "faq", "none"
 
 export async function extractGlobalIntent(message, serviceNames = []) {
+  if (isLlmDegraded()) {
+    return extractGlobalIntentDegraded(message, serviceNames);
+  }
+
   const servicesHint = serviceNames.length
     ? `Known services at this business: ${serviceNames.join(', ')}.`
     : '';
@@ -383,6 +375,8 @@ export async function extractConfirmation(message) {
   if (YES_REGEX.test(trimmed)) return 'yes';
   if (NO_REGEX.test(trimmed))  return 'no';
 
+  if (isLlmDegraded()) return 'unknown';
+
   const prompt = `
 Does this message mean YES or NO? Reply with exactly "yes", "no", or "unknown".
 
@@ -415,6 +409,8 @@ export async function detectHandoffIntent(message) {
   const trimmed = message.trim();
   if (HANDOFF_REGEX.test(trimmed)) return true;
 
+  if (isLlmDegraded()) return false;
+
   // LLM fallback for more subtle phrasing
   const prompt = `Does this message mean the user wants to stop talking to the bot and speak to a real human instead? Reply only "yes" or "no".
 
@@ -431,6 +427,10 @@ Message: "${trimmed}"`;
 // ─── 4. Conversational / FAQ answer ──────────────────────────────────────────
 
 export async function answerConversational(question, businessContext = {}) {
+  if (isLlmDegraded()) {
+    return DEGRADED_CONVERSATIONAL_FALLBACK;
+  }
+
   const ctx = [
     businessContext.name    && `Business name: ${businessContext.name}`,
     businessContext.type    && `Business type: ${businessContext.type}`,
@@ -469,6 +469,10 @@ export async function generateInactivityNudge({
   businessType,
   lastStepDescription,
 }) {
+  if (isLlmDegraded()) {
+    return DEGRADED_NUDGE_FALLBACK;
+  }
+
   const ctx = [
     businessName && `Business name: ${businessName}`,
     businessType && `Business type: ${businessType}`,
@@ -508,6 +512,10 @@ export async function generateHelpReply({
   services = [],
   customerName = null,
 }) {
+  if (isLlmDegraded()) {
+    return generateHelpReplyDegraded({ businessName, businessType, services, customerName });
+  }
+
   const serviceList = services.length
     ? services.map((s) => `${s.name}${s.price != null ? ` (₹${parseFloat(s.price).toLocaleString('en-IN')})` : ''}`).join(', ')
     : '';
@@ -553,6 +561,10 @@ export async function generateReturningUserGreeting({
   businessType,
   services = [],
 }) {
+  if (isLlmDegraded()) {
+    return generateReturningUserGreetingDegraded({ businessName, customerName, businessType, services });
+  }
+
   const topServices = services.slice(0, 3).map(s => s.name).join(', ');
 
   const prompt = `
@@ -583,6 +595,10 @@ export async function generateDynamicFallbackReply({
   businessName,
   businessType,
 }) {
+  if (isLlmDegraded()) {
+    return DEGRADED_FALLBACK_REPLY;
+  }
+
   const ctx = [
     businessName && `Business: ${businessName}`,
     businessType && `Business type: ${businessType}`,

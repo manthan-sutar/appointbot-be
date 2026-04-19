@@ -1,11 +1,17 @@
 // ─── Date / time helpers ──────────────────────────────────────────────────────
 
 export function formatDate(dateStr) {
+  if (dateStr == null || typeof dateStr !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim())) {
+    return '—';
+  }
   const d = new Date(dateStr + 'T12:00:00');
   return d.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 }
 
 export function formatTime(timeStr) {
+  if (timeStr == null || typeof timeStr !== 'string' || !timeStr.includes(':')) {
+    return '—';
+  }
   const [h, m] = timeStr.split(':').map(Number);
   const period = h >= 12 ? 'PM' : 'AM';
   const hour   = h % 12 || 12;
@@ -136,7 +142,8 @@ export function formatServiceList(services, businessType = null) {
     `Which service are you looking for?`,
   ]);
 
-  return `${prompt}\n\n${list}\n\nReply with the number or name.`;
+  return `${prompt}\n\n${list}\n\n` +
+    `Reply with the number or name — *one or more* (e.g. _1, 4_ or _beard trim and facial_).`;
 }
 
 // ─── Staff selection prompt ───────────────────────────────────────────────────
@@ -240,7 +247,7 @@ export function formatAppointmentList(appointments, customerName = null, busines
     ? `📋 *${customerName}'s Upcoming Bookings:*`
     : `📋 *Your Upcoming Bookings:*`;
 
-  return `${header}\n\n${list}\n\nTo cancel or reschedule, just say _"cancel"_ or _"reschedule"_.`;
+  return `${header}\n\n${list}\n\nTo cancel or reschedule, say *cancel* or *reschedule*, or reply with the booking number (*1*, *2*, …).`;
 }
 
 // ─── Cancellation confirmed ───────────────────────────────────────────────────

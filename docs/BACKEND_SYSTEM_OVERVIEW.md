@@ -8,6 +8,7 @@ Related docs:
 - API reference: `docs/API.md`
 - WhatsApp testing notes: `docs/WHATSAPP_TESTING.md`
 - UI notes: `docs/UI_ANALYSIS.md`
+- Assistant capabilities + stability roadmap: `docs/ASSISTANT_CAPABILITIES_REPORT.md`, `docs/IMPLEMENTATION_ROADMAP.md`
 
 ## 1) High-level architecture
 
@@ -96,6 +97,8 @@ There are two accepted payload styles:
 - WhatsApp Cloud API webhook payload (`entry[].changes[].value.messages[0]`)
 - A legacy internal chat proxy payload (`From`, `Body`, `businessId`, `To`) used by the `/chat` test UI
 
+`src/routes/chat.js` (and the widget API in `widget-public.js`) forwards messages by **server-side** `fetch` to this same process’s `/webhook`. The base URL uses `internalWebhookBaseUrl()` (`src/utils/publicBackendUrl.js`) so that when the browser is on the **Vite dev server** (`Host: localhost:5173`), Node calls `http://127.0.0.1:${PORT}/webhook` instead of `http://localhost:5173/webhook` (which would not reach Express).
+
 High-level WhatsApp handler steps (`src/routes/webhook.js`):
 1. Extract incoming message content:
    - If message is `type=text|button|interactive`, pull the relevant text fields.
@@ -111,6 +114,7 @@ High-level WhatsApp handler steps (`src/routes/webhook.js`):
 5. Handle intents and advance the state machine:
    - Fast-path keyword handling (`HELP`, `SERVICES`, `CANCEL`, `MY BOOKINGS`, acknowledgements)
    - If idle: call LLM classifier (`classifyMessage`) for intent + handoff
+   - If idle + book intent + **no service chosen yet** but the user already gave a **time** (with or without a date): resolve an implied calendar day (explicit date, else **tomorrow** in business TZ) and call `getFirstStaffWithSlotsOnDate`; if that day has **no** availability (closed exception, weekly off, full), reply **before** listing services so users are not asked to pick a service for a day that cannot be booked
    - Otherwise: continue the existing state (`AWAITING_SERVICE`, `AWAITING_DATE`, ...)
 6. Persist state transitions:
    - `updateSession(phone, businessId, nextState, tempData)`
@@ -183,6 +187,7 @@ Core booking functions (`src/services/appointment.service.js`):
 - Availability:
   - `getAvailableSlots(businessId, date, staffId, durationMinutes, tz)`
     - Reads weekly recurring `availability` for that staff + day_of_week
+    - Applies **business calendar exceptions** (`business_calendar_exceptions`): a row for that `business_id` + calendar date can mark the day **closed** (no slots) or **shortened hours** (`open_start` / `open_end` intersected with the staff’s weekly window)
     - Reads booked appointments for that day and staff to compute blocked minutes
     - Creates 30-minute slots that fit `durationMinutes` and are not in the past
 - Slot suggestion across dates:
@@ -199,9 +204,10 @@ Core booking functions (`src/services/appointment.service.js`):
   - `getUpcomingAppointments(phone, businessId)` returns up to 5
 
 ### 3.6 AI behavior
-LLM router and helpers (`src/services/ai.service.js`):
+LLM router and helpers (`src/services/ai.service.js`, `src/services/llmClient.js`, `src/services/aiDegraded.js`):
 - Uses Groq OpenAI-compatible endpoints if `GROQ_API_KEY` exists
 - Otherwise falls back to a local Ollama server via `OLLAMA_URL`
+- **Resilience:** timeouts, retries, circuit breaker (`llmClient.js`); **degraded mode** when `LLM_DEGRADED` is set or the circuit is open — keyword/rule fallbacks (`aiDegraded.js`) instead of LLM calls
 
 Key functions:
 - `classifyMessage(message, serviceNames)`:
@@ -295,6 +301,8 @@ Main tables and relationships:
 - `availability`
   - `staff_id` -> `staff.id`
   - weekly recurring availability by `day_of_week`, `start_time`, `end_time`
+- `business_calendar_exceptions`
+  - `business_id` + `exception_date` (unique): optional `closed` (full day off) or **open** with `open_start` / `open_end` for that date only (merged into `getAvailableSlots`)
 - `appointments`
   - `business_id` -> `businesses.id`
   - `staff_id` -> `staff.id` (SET NULL on delete)
@@ -307,6 +315,7 @@ Main tables and relationships:
 
 Index notes:
 - Availability: `idx_availability_staff`
+- Calendar exceptions: `idx_business_calendar_exceptions_biz_date`
 - Appointments: indexes by `business_id`, `customer_phone`, and `staff_id + scheduled_at`
 - Sessions and customers: indexes on `phone`
 
