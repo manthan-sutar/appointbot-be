@@ -90,6 +90,12 @@ export function classifyMessageDegraded(message, serviceNames = []) {
   if (/\b(my\s+bookings?|my\s+appointments?|show\s+(me\s+)?my\s+bookings?|upcoming\s+appointments?|list\s+my\s+)/i.test(normalized)) {
     return { handoff: false, intent: 'my_appointments' };
   }
+  // Named services in the message → book (before "book again" → repeat), e.g. "book again Tuesday for facial"
+  for (const name of serviceNames) {
+    if (name && lower.includes(String(name).toLowerCase())) {
+      return { handoff: false, intent: 'book' };
+    }
+  }
   if (/\b(same\s+(as\s+)?(last|before|usual)|book\s+again|rebook|repeat\s+booking|same\s+appointment)\b/i.test(normalized)) {
     return { handoff: false, intent: 'repeat_booking' };
   }
@@ -104,12 +110,6 @@ export function classifyMessageDegraded(message, serviceNames = []) {
   }
   if (/\b(language|hindi|hinglish|what\s+is\s+this|are\s+you\s+a\s+bot|who\s+are\s+you)\b/i.test(lower)) {
     return { handoff: false, intent: 'faq' };
-  }
-
-  for (const name of serviceNames) {
-    if (name && lower.includes(String(name).toLowerCase())) {
-      return { handoff: false, intent: 'book' };
-    }
   }
 
   if (/\b(book|booking|appointment|schedule|reserve|visit)\b/i.test(lower)) {

@@ -46,6 +46,7 @@ import {
   normalizeRelativeDateTypos,
   normalizeCasualServiceTypos,
   extractFallbackRelativeDate,
+  specifiesNewBookingServices,
 } from '../utils/conversationRepair.js';
 
 const router = express.Router();
@@ -1466,7 +1467,12 @@ export async function handleMessage({
 
         // If LLM said "book" but the user clearly meant "book the same again", route to repeat_booking
         // so we prefill *service + staff* from their most recent appointment.
-        if (intent === 'book' && KEYWORD_SAME_SERVICE.test(messageForIntent)) {
+        // Do not treat "book again … for facial and haircut" as repeat — that's a new booking with named services.
+        if (
+          intent === 'book' &&
+          KEYWORD_SAME_SERVICE.test(messageForIntent) &&
+          !specifiesNewBookingServices(messageForIntent, idleServices)
+        ) {
           intent = 'repeat_booking';
         }
 
@@ -1525,49 +1531,53 @@ export async function handleMessage({
         }
 
         if (intent === 'repeat_booking') {
-          const last = await getMostRecentAppointment(phone, businessId);
-          if (!last?.service_id || !last?.staff_id) {
-            reply = `Sure — what would you like to book?\n\nJust tell me the service and the date.`;
-            break;
-          }
-
-          // If service/staff was deleted or deactivated, fall back to normal booking flow.
-          if (last.service_active === false || last.staff_active === false) {
-            const services = idleServices.length ? idleServices : await getServices(businessId);
-            reply = `Sure — what would you like to book?\n\n` + (services.length ? formatServiceList(services, businessType) : `Just tell me the service and date.`);
-            break;
-          }
-
-          const prefilled = {
-            serviceId: last.service_id,
-            serviceName: last.service_name,
-            durationMinutes: last.service_duration_minutes || last.duration_minutes || 30,
-            price: last.service_price ?? null,
-            staffId: last.staff_id,
-            staffName: last.staff_name,
-            lockStaff: true,
-            date: null,
-            time: null,
-            displaySlots: null,
-          };
-
-          // If they already included a date/time in the same message, proceed immediately.
-          const ri = await extractBookingIntent(messageForIntent, [], businessTZ);
-          if (ri?.date) {
-            await updateSession(phone, businessId, STATES.AWAITING_DATE, {
-              ...prefilled,
-              time: ri.time || null, // optional preference; may auto-skip slot picker if available
-            });
-            nextState = STATES.AWAITING_DATE;
-            lastStepDescriptionForNudge = `Continuing a repeat booking by asking for a date.`;
-            reply = `Got it — *${prefilled.serviceName}* with *${prefilled.staffName}* again.\n\nWhat date works for you?`;
+          if (specifiesNewBookingServices(messageForIntent, idleServices)) {
+            intent = 'book';
           } else {
-            await updateSession(phone, businessId, STATES.AWAITING_DATE, prefilled);
-            nextState = STATES.AWAITING_DATE;
-            lastStepDescriptionForNudge = `Asking which date works for their repeat booking.`;
-            reply = `Got it — *${prefilled.serviceName}* with *${prefilled.staffName}* again.\n\nWhat date works for you?`;
+            const last = await getMostRecentAppointment(phone, businessId);
+            if (!last?.service_id || !last?.staff_id) {
+              reply = `Sure — what would you like to book?\n\nJust tell me the service and the date.`;
+              break;
+            }
+
+            // If service/staff was deleted or deactivated, fall back to normal booking flow.
+            if (last.service_active === false || last.staff_active === false) {
+              const services = idleServices.length ? idleServices : await getServices(businessId);
+              reply = `Sure — what would you like to book?\n\n` + (services.length ? formatServiceList(services, businessType) : `Just tell me the service and date.`);
+              break;
+            }
+
+            const prefilled = {
+              serviceId: last.service_id,
+              serviceName: last.service_name,
+              durationMinutes: last.service_duration_minutes || last.duration_minutes || 30,
+              price: last.service_price ?? null,
+              staffId: last.staff_id,
+              staffName: last.staff_name,
+              lockStaff: true,
+              date: null,
+              time: null,
+              displaySlots: null,
+            };
+
+            // If they already included a date/time in the same message, proceed immediately.
+            const ri = await extractBookingIntent(messageForIntent, [], businessTZ);
+            if (ri?.date) {
+              await updateSession(phone, businessId, STATES.AWAITING_DATE, {
+                ...prefilled,
+                time: ri.time || null, // optional preference; may auto-skip slot picker if available
+              });
+              nextState = STATES.AWAITING_DATE;
+              lastStepDescriptionForNudge = `Continuing a repeat booking by asking for a date.`;
+              reply = `Got it — *${prefilled.serviceName}* with *${prefilled.staffName}* again.\n\nWhat date works for you?`;
+            } else {
+              await updateSession(phone, businessId, STATES.AWAITING_DATE, prefilled);
+              nextState = STATES.AWAITING_DATE;
+              lastStepDescriptionForNudge = `Asking which date works for their repeat booking.`;
+              reply = `Got it — *${prefilled.serviceName}* with *${prefilled.staffName}* again.\n\nWhat date works for you?`;
+            }
+            break;
           }
-          break;
         }
 
         if (intent === 'availability') {
@@ -1650,7 +1660,11 @@ export async function handleMessage({
           }
 
           // "Book the same again" / "rebook" — look up their last booked service
-          if (!service && KEYWORD_SAME_SERVICE.test(message)) {
+          if (
+            !service &&
+            KEYWORD_SAME_SERVICE.test(message) &&
+            !specifiesNewBookingServices(repairedBookingMsg, services)
+          ) {
             const lastSvc = await getLastBookedService(phone, businessId);
             if (lastSvc?.active !== false) {
               service = services.find(s => s.id === lastSvc?.service_id)

@@ -290,7 +290,8 @@ Intent rules:
 - "book" — wants to book/schedule, mentions a service name, OR mentions a date/time
 - "cancel" — cancel an existing appointment
 - "reschedule" — MOVE/CHANGE an existing appointment to a new date/time
-- "repeat_booking" — wants to BOOK A NEW appointment similar to the last one / same appointment again (do NOT modify existing booking). Trigger phrases include: "same appointment", "book again", "similar to last", "same one", "repeat booking", "one more like before", "same one next month"
+- "repeat_booking" — wants to BOOK A NEW appointment similar to the last one / same appointment again (do NOT modify existing booking). Trigger phrases include: "same appointment", "similar to last", "same one", "repeat booking", "one more like before", "same one next month", or a short "book again" with NO new services listed.
+- CRITICAL: If the message says "book again" but ALSO names specific services or "for facial, haircut, …" or a date/time plus services → intent MUST be "book", not "repeat_booking".
 - "reminder" — wants the bot to NOTIFY them at a specific time (e.g. "remind me at 7pm", "send me a reminder"). NOT the same as reschedule.
 - "my_appointments" — wants to see their upcoming bookings
 - "availability" — asks what slots/times are free

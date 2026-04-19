@@ -1,3 +1,8 @@
+import {
+  matchServiceFromMessage,
+  matchServicesFromMessage,
+} from './serviceMatch.js';
+
 /**
  * Phase 2 — conversation repair: strip "actually / I meant / sorry" style prefixes
  * so the remainder can be matched by extractBookingIntent / matchServicesFromMessage.
@@ -48,7 +53,44 @@ export function normalizeCasualServiceTypos(message) {
     .replace(/\bbeard\s+trip\b/gi, 'beard trim')
     .replace(/\bharicut\b/gi, 'haircut')
     .replace(/\bhair\s*cutt\b/gi, 'haircut')
+    .replace(/\bhaircolor\b/gi, 'hair colour')
     .trim();
+}
+
+/**
+ * True when the user names specific catalog services (new booking), so we should not treat
+ * phrases like "book again" as "repeat last appointment only".
+ * Example: "I would like to book again on Tuesday for facial, hair colour and haircut" → true.
+ * @param {string} message
+ * @param {{ name: string }[]} services
+ */
+export function specifiesNewBookingServices(message, services) {
+  if (!message?.trim() || !services?.length) return false;
+  const repaired = normalizeCasualServiceTypos(normalizeRelativeDateTypos(message));
+  const lower = repaired.toLowerCase();
+
+  const againIdx = lower.search(/\bbook\s+again\b/);
+  const forIdx = lower.search(/\bfor\b/);
+  if (againIdx !== -1 && forIdx !== -1 && forIdx > againIdx) {
+    const afterFor = repaired.slice(forIdx).replace(/^for\s+/i, '').trim();
+    if (matchServicesFromMessage(afterFor, services)?.length) return true;
+    if (matchServiceFromMessage(afterFor, services)) return true;
+  }
+
+  if (matchServicesFromMessage(repaired, services)?.length >= 2) return true;
+
+  const forMatch = repaired.match(/\bfor\s+(.+)/is);
+  if (forMatch) {
+    const rest = forMatch[1].trim();
+    if (matchServicesFromMessage(rest, services)?.length) return true;
+    if (matchServiceFromMessage(rest, services)) return true;
+  }
+
+  for (const s of services) {
+    const n = String(s.name || '').toLowerCase().trim();
+    if (n.length >= 4 && lower.includes(n)) return true;
+  }
+  return false;
 }
 
 /**
