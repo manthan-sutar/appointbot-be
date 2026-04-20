@@ -241,9 +241,15 @@ const KEYWORD_SAME_SERVICE = /\b(same\s+(as\s+)?(last|before|previous|usual|time
 // Post-action acknowledgements — "Great!", "Thanks", "Perfect" etc.
 // Skip the LLM entirely; reply with a brief, context-free thank-you.
 const KEYWORD_ACK = /^(great|thanks|thank\s*you|thankyou|thx|ty|perfect|awesome|excellent|nice|cool|sweet|ok\s*thanks|okay\s*thanks|got\s*it|noted|alright|brilliant|cheers|👍+|🙏+|😊+)[\s\!\.\,🙂😊]*$/i;
-// Match "Yes I'll come" and common typos: "Yes Il come", "Yes I come", "yes ill come"
+// Match reminder confirmations including common typos/variants:
+// "Yes I'll come", "Yes Il come", "Yes I'll do", "Yes I will do", "confirm"
 // (strict ^…$ so longer phrases still go to the LLM)
-const KEYWORD_CONFIRM_ARRIVAL = /^(yes|yes i['’]?(?:ll|l)? come|i['’]?(?:ll|l)? come|coming|confirm|confirmed)\s*[\.\!\?]*$/i;
+const KEYWORD_CONFIRM_ARRIVAL =
+  /^(yes(?:\s+i(?:['’]?(?:ll|l)|\s+will)?\s+(?:come|do))?|i(?:['’]?(?:ll|l)|\s+will)?\s+(?:come|do)|coming|confirm|confirmed)\s*[\.\!\?]*$/i;
+// Lightweight gate before AI confirmation extraction, so we only spend LLM calls
+// on short messages that plausibly mean "yes I'll come".
+const KEYWORD_CONFIRM_ARRIVAL_CANDIDATE =
+  /^(yes|y|ok|okay|sure|confirm|confirmed|coming|haan|ha|i['’]?(?:ll|l)|i\s+will)\b/i;
 const KEYWORD_GLOBAL_STOP = /^(stop|unsubscribe|opt\s*out|remove\s*me|stop\s*campaigns?)\s*[\.\!\?]*$/i;
 const KEYWORD_GLOBAL_START = /^(start|subscribe|opt\s*in|resume)\s*[\.\!\?]*$/i;
 
@@ -454,12 +460,26 @@ export async function handleMessage({
       return { reply, businessId };
     }
 
-    // ── HELP fast-path ────────────────────────────────────────────────────────
-    if (state === STATES.IDLE && KEYWORD_CONFIRM_ARRIVAL.test(msgNorm)) {
-      const confirmedAppt = await markNextPendingAppointmentConfirmedForCustomer(phone, businessId);
-      if (confirmedAppt) {
-        reply = `Perfect, you're confirmed. See you soon!`;
-        return { reply, businessId };
+    // ── Reminder-confirmation fast-path (AI-backed) ───────────────────────────
+    if (state === STATES.IDLE) {
+      const isDirectConfirm = KEYWORD_CONFIRM_ARRIVAL.test(msgNorm);
+      const isLikelyConfirmCandidate =
+        !isDirectConfirm &&
+        msgNorm.length <= 40 &&
+        KEYWORD_CONFIRM_ARRIVAL_CANDIDATE.test(msgNorm);
+
+      let isReminderConfirmation = isDirectConfirm;
+      if (!isReminderConfirmation && isLikelyConfirmCandidate) {
+        const confirmIntent = await extractConfirmation(messageForIntent);
+        isReminderConfirmation = confirmIntent === 'yes';
+      }
+
+      if (isReminderConfirmation) {
+        const confirmedAppt = await markNextPendingAppointmentConfirmedForCustomer(phone, businessId);
+        if (confirmedAppt) {
+          reply = `Perfect, you're confirmed. See you soon!`;
+          return { reply, businessId };
+        }
       }
     }
 

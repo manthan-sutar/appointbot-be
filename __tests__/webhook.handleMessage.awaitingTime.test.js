@@ -27,6 +27,7 @@ const mockTrackLeadEvent = jest.fn();
 const mockMarkLeadConverted = jest.fn();
 const mockGetFirstStaffWithSlotsOnDate = jest.fn();
 const mockInc = jest.fn();
+const mockMarkNextPendingAppointmentConfirmedForCustomer = jest.fn();
 
 jest.unstable_mockModule('../src/config/db.js', () => ({
   query: mockQuery,
@@ -74,7 +75,7 @@ jest.unstable_mockModule('../src/services/appointment.service.js', () => ({
   findNextSlotNearTime: jest.fn(),
   getLastBookedService: jest.fn(),
   getMostRecentAppointment: jest.fn(),
-  markNextPendingAppointmentConfirmedForCustomer: jest.fn(),
+  markNextPendingAppointmentConfirmedForCustomer: mockMarkNextPendingAppointmentConfirmedForCustomer,
 }));
 
 jest.unstable_mockModule('../src/services/ai.service.js', () => ({
@@ -312,5 +313,73 @@ describe('handleMessage — AWAITING_TIME', () => {
         pendingBooking: expect.objectContaining({ time: '10:00', customerName: 'Sam' }),
       }),
     );
+  });
+});
+
+describe('handleMessage — reminder confirmation fast-path', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUpsertLeadActivity.mockResolvedValue(null);
+    mockGetBusiness.mockResolvedValue({
+      id: 1,
+      name: 'Test Biz',
+      timezone: 'Asia/Kolkata',
+      type: 'salon',
+    });
+    mockGetCustomerName.mockResolvedValue('Manthan');
+    mockGetBusinessByWhatsAppPhoneNumberId.mockResolvedValue(null);
+    mockGetBusinessByPhone.mockResolvedValue(null);
+    mockGetSession.mockResolvedValue({
+      phone: '+1000',
+      businessId: 1,
+      state: 'IDLE',
+      temp: {},
+      timedOut: false,
+      updatedAt: new Date('2026-04-20T03:50:00.000Z'),
+    });
+  });
+
+  test('confirms pending appointment for "Yes Il do"', async () => {
+    mockMarkNextPendingAppointmentConfirmedForCustomer.mockResolvedValue({
+      id: 99,
+      confirmation_status: 'confirmed',
+    });
+
+    const { reply } = await handleMessage({
+      rawPhone: '+1000',
+      message: 'Yes Il do',
+      explicitBusinessId: 1,
+      toNumberForRouting: '',
+      leadSource: null,
+      leadCampaign: null,
+      leadUtmSource: null,
+    });
+
+    expect(mockMarkNextPendingAppointmentConfirmedForCustomer).toHaveBeenCalledWith('+1000', 1);
+    expect(reply).toBe(`Perfect, you're confirmed. See you soon!`);
+    expect(mockClassifyMessage).not.toHaveBeenCalled();
+  });
+
+  test('uses AI confirmation intent for non-regex variant', async () => {
+    mockExtractConfirmation.mockResolvedValue('yes');
+    mockMarkNextPendingAppointmentConfirmedForCustomer.mockResolvedValue({
+      id: 100,
+      confirmation_status: 'confirmed',
+    });
+
+    const { reply } = await handleMessage({
+      rawPhone: '+1000',
+      message: 'yes will do it',
+      explicitBusinessId: 1,
+      toNumberForRouting: '',
+      leadSource: null,
+      leadCampaign: null,
+      leadUtmSource: null,
+    });
+
+    expect(mockExtractConfirmation).toHaveBeenCalledWith('yes will do it');
+    expect(mockMarkNextPendingAppointmentConfirmedForCustomer).toHaveBeenCalledWith('+1000', 1);
+    expect(reply).toBe(`Perfect, you're confirmed. See you soon!`);
+    expect(mockClassifyMessage).not.toHaveBeenCalled();
   });
 });
